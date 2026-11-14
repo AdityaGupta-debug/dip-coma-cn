@@ -1,0 +1,585 @@
+\documentclass[journal]{IEEEtran}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{url}
+\usepackage{array}
+\usepackage{cite}
+\usepackage{enumitem}
+\usepackage{balance}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\hypersetup{hidelinks}
+\graphicspath{{figures/}{../reports/}{experiment_cpaisd/reports/}{experiment_cpaisd/paper/figures/}}
+
+\title{Reference-Based Integrity Checking and Metadata Anomaly Detection for DICOM Brain CT: A Controlled Study of Metadata and Pixel Tampering}
+
+\author{Aditya Upendra Gupta, Aaditya Awasthi, Nidal, and Sudhawalli\\
+\thanks{This manuscript reports an exploratory, single-dataset experiment using CPAISD. It is not a clinical validation study.}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Digital Imaging and Communications in Medicine (DICOM) objects combine image pixels with metadata used to identify, organize, and interpret imaging studies. This paper reports controlled metadata and pixel-integrity experiments on CPAISD non-contrast brain CT. The metadata experiment used official 92/10/10-study train/validation/test folds (8,376/980/809 instances); its original six-condition macro F1 was 1.000 for per-file metadata SHA-256, 0.170 for structural rules, 0.116 for Isolation Forest, 0.506 for the autoencoder, and 0.635 for the OR hybrid. Hash performance is expected because each clean test file supplied its own reference. In three benign-like controls applied to 809 test files, pixel data and non-target clinical attributes remained unchanged; the hash flagged file-meta and privacy-marker edits but not metadata-preserving reserialization, while anomaly-model alarms did not increase over clean controls. A feature-aware same-length ProtocolName substitution preserved the engineered feature vector in all 177 modified files and evaded each non-hash detector, while SHA-256 detected all edits. A reference-free header-to-pixel layout checker detected 177/177 Rows and Columns mismatches with no findings on clean files or pixel-only controls. Study-level conformal calibration was coarse with ten validation studies: at $\alpha=0.10$, clean-test FPR was 0 for Isolation Forest and 0.10 for the autoencoder. No-reference pixel models had poor localization and the residual comparator's modest image recall came with a high alarm rate. Three study-selection seeds add attack-selection sensitivity analysis but not independent patients. Results remain exploratory and do not establish clinical utility, external generalization, or broad adaptive-attack resistance.
+\end{abstract}
+
+\begin{IEEEkeywords}
+DICOM, metadata integrity, pixel integrity, medical imaging security, anomaly detection, SHA-256, computed tomography.
+\end{IEEEkeywords}
+
+\section{Introduction}
+\IEEEPARstart{M}{edical} imaging workflows depend on DICOM objects to transport and store pixel arrays together with attributes describing the patient, study, series, acquisition, and equipment. Metadata is operationally important: identifiers associate instances with a patient and study, while technical attributes can affect image interpretation, measurement, routing, and downstream processing. A file may therefore undergo a metadata change without a visible change to its pixel data. Security mechanisms that inspect only image appearance will not necessarily detect such a change.
+
+Cryptographic integrity mechanisms, digital signatures, and reversible watermarking have been studied for DICOM authenticity and tamper detection. DICOM PS3.15 specifies security and system-management profiles, including digital-signature and audit-trail profiles \cite{dicomps315}. These methods typically rely on a reference, key, signature, or embedded watermark. Statistical anomaly detectors offer a different capability: they can flag values that depart from patterns learned from clean data, even when an exact trusted original is not available. Their limitation is that statistical unusualness is not equivalent to maliciousness, and a plausible but incorrect change may not be anomalous.
+
+This work evaluates these complementary mechanisms on CPAISD, a public cohort of hyperacute ischemic stroke non-contrast CT studies. The objectives are to: (i) compare reference hashing, structural rules, and unsupervised anomaly detectors on controlled metadata edits; (ii) assess a clean-training, no-reference pixel anomaly baseline against synthetic pixel masks; (iii) quantify three synthetic pixel edits at three severities; and (iv) evaluate paired metadata-plus-pixel integrity checks. The contribution is a reproducible, dataset- and protocol-specific implementation and comparison, not a new cryptographic primitive, anomaly algorithm, or image-localization detector. Prior DICOM integrity and watermark-based localization work precludes a broad claim of first-ever tamper detection \cite{kobayashi2009,tan2011,dou2012,alhaj2015,oh2026}.
+
+The principal questions are: \emph{How do reference-based hashing, structural rules, and unsupervised metadata anomaly detectors behave on controlled metadata edits and untouched held-out studies? How do edit severity and paired metadata-plus-pixel conditions affect reference-based detection and difference summaries?}
+
+\subsection{Threat model}
+The experiments use two separate attack tracks. In the metadata track, the attacker changes selected header values but not PixelData or the protected reference manifest. In the pixel track, the attacker changes selected stored pixel values but not metadata or the reference. Both hash comparators are given the exact clean per-file reference. This closed, non-adaptive setup does not evaluate manifest compromise, adaptive edits, PACS audit-log alteration, sender impersonation, or clinical correctness. A mismatch indicates change relative to the known original, not malicious intent.
+
+\subsection{Design expectations}
+The evaluation was guided by four expectations. First, metadata included in the canonical digest should produce a hash mismatch after an edit. Second, fixed rules should detect only violations of the explicitly implemented constraints. Third, anomaly detectors may identify feature-space shifts, with performance depending on validation calibration and feature representation. Fourth, the OR fusion cannot lower recall relative to its constituent detectors on the same labels, but can increase false-positive rate. The last property follows directly from the decision rule and is not treated as evidence of a novel fusion method.
+
+\section{Literature Survey}
+Research on medical-image integrity has primarily used cryptographic authentication, digital signatures, or reversible watermarking. More recent forensic work correlates DICOM tags with PACS databases and audit artifacts. These approaches address integrity or provenance, while the current experiment emphasizes a small, controlled comparison of exact-reference, rule-based, and unsupervised anomaly signals on CT metadata.
+
+\subsection{Reviewed studies}
+Kobayashi \emph{et al.} describe a cryptographic method linking DICOM images with integrity and authenticity information while preserving the image presented to the end user \cite{kobayashi2009}. The work motivates a trusted reference and cryptographic binding, but does not provide the present study's anomaly-detection comparison or a CPAISD brain-CT evaluation.
+
+Tan \emph{et al.} propose a dual-layer, reversible watermarking method embedding DICOM patient metadata and source information, with public-key protection of a location signal and block-level CRC data for tamper localization \cite{tan2011}. They evaluate four sample images across CT, MRI, ultrasound, and angiography using payload capacity, MSE, PSNR, runtime, and controlled tamper localization. The small image-level test is designed to assess watermarking, not dataset-level metadata classification or false-positive rates across held-out studies.
+
+Dou \emph{et al.} extend reversible watermarking to volumetric DICOM by using horizontal and vertical checks to improve processing efficiency and localization resolution \cite{dou2012}. Four small volumetric MRI sets (knee, shoulder, heart, and brain) were evaluated for embedding/de-embedding time and tamper localization. The paper reports approximately 65\% lower watermarking time and 72\% lower dewatermarking time on average relative to direct 2-D processing, and 100\% localization on its systematic tamper cases. Its objective is image-space tamper localization, not metadata-only anomaly detection.
+
+Al-Haj proposes cryptographic encryption, hashes, and signatures to protect both header and pixel data \cite{alhaj2015}. Evaluation uses 20 MRI brain DICOM images and reports image-security measures including entropy, PSNR, normalized correlation, histogram behavior, attack robustness, and processing time. The approach supplies a cryptographic integrity comparator, but does not compare learned detectors against explicit field-level metadata edits.
+
+Oh \emph{et al.} present a forensic workflow combining DICOM-tag analysis with PACS database and system-log artifacts \cite{oh2026}. Their study constructs 82 samples over 40 manipulation types using two PACS platforms and reports validation on 110 cases; modifications reflected in exported DICOM files were detected. This work is especially close in problem setting. Its use of system artifacts supports attribution and forensic context unavailable to the current file-only pipeline, while the CPAISD experiment adds a controlled comparison of ML anomaly signals on a public CT cohort. The present work cannot make claims about attribution or intent.
+
+CPAISD itself was introduced as a dataset for early ischemic stroke analysis from non-contrast CT, with annotations for core and penumbra regions \cite{umerenkov2025}. Its official release contains 112 studies, split into training, validation, and testing folds. Those clinical annotations are not used by the metadata-security experiment.
+
+\begin{table*}[t]
+\caption{Comparison of representative DICOM integrity and forensic studies. Metrics are reported as described by each paper; they are not directly comparable across tasks.}
+\label{tab:literature}
+\centering\footnotesize
+\begin{tabular}{p{2.7cm}p{4.0cm}p{3.1cm}p{3.5cm}p{4.4cm}}
+\toprule
+\textbf{Author / Year} & \textbf{Methodology} & \textbf{Dataset} & \textbf{Evaluation metrics} & \textbf{Critical gap relative to this study} \\
+\midrule
+Kobayashi \emph{et al.} (2009) \cite{kobayashi2009} & Cryptographic integrity/authenticity binding for DICOM; preserves image quality to the end user. & DICOM medical-image setting; sample count and cohort details not specified in the indexed abstract. & Cryptographic integrity/authenticity properties; no standard classification metrics stated in the abstract. & No comparison of metadata anomaly detectors or held-out false-positive rates on a CT cohort. \\
+Tan \emph{et al.} (2011) \cite{tan2011} & Dual-layer reversible watermarking; RSA-protected location information and block CRC for detection/localization. & Four sample DICOM images: CT, MRI, ultrasound, and angiography. & Capacity, MSE, PSNR, runtime, and tamper localization; systematic tampering included single-pixel and block edits. & Image watermarking/localization rather than metadata-only, multi-study detection; very small image sample. \\
+Dou \emph{et al.} (2012) \cite{dou2012} & 3-D-aware reversible watermarking with horizontal/vertical integrity data. & Four volumetric MRI sets (knee, shoulder, heart, brain). & Watermarking and dewatermarking time; systematic and practical tamper localization; reported 100\% localization in systematic cases. & Focuses on image-space tampering and watermark efficiency, not metadata field changes or learned anomaly detection. \\
+Al-Haj (2015) \cite{alhaj2015} & Cryptographic encryption, hashing, and signatures to provide confidentiality, integrity, and authenticity for header and pixels. & Benchmark of 20 MRI brain DICOM images. & Entropy, PSNR, normalized correlation, histogram analysis, robustness to attacks, encryption/decryption time. & Cryptographic design rather than comparative field-level tamper classification; no clean cohort FPR analysis. \\
+Oh \emph{et al.} (2026) \cite{oh2026} & Forensic correlation of DICOM tags, PACS database state, and system logs. & 82 samples across 40 tampering types; 110 validation cases; two PACS platforms. & Detection of modifications reflected in DICOM/PACS artifacts; reported all such modifications detected in validation cases. & Uses system-level artifacts unavailable in this project; no unsupervised model comparison on public NCCT data. \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Research gap and defensible contribution}
+The reviewed literature establishes that DICOM integrity, watermarking, and forensic inspection are active topics; the gap is not a lack of DICOM tamper-detection research. Rather, within the reviewed work, we found no head-to-head experiment matching this exact metadata setup: SHA-256 comparison, structural checks, Isolation Forest, and an autoencoder evaluated against the same simulated field edits on official CPAISD folds with untouched test controls. The pixel extension is a controlled reference-hash, reference-free anomaly, and difference-visualization experiment, not a novel image-tamper detector; prior literature already addresses pixel integrity and localization. The added layout rules and feature-collision test are protocol-specific diagnostics of internal consistency and representation blind spots, not new algorithms. These are dataset- and protocol-specific comparisons, not claims of algorithmic novelty or comprehensive literature coverage. Since clean per-file references are available, the expected hash performance is a deterministic integrity control rather than evidence that ML improves on cryptographic verification.
+
+\section{Proposed Methodology}
+\subsection{System overview}
+The workflow preserves the metadata and pixel investigations as distinct tracks. The metadata track extracts header features, fits unsupervised models using training data, calibrates thresholds on validation data, and evaluates controlled metadata edits. The pixel track includes reference-free anomaly baselines, header-to-pixel layout checks, and a separate reference-based integrity experiment that computes edit-mask and difference summaries. Study-level conformal calibration, benign-change controls, a feature-aware evasion condition, and per-alert explanations extend the evaluation.
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=5mm,
+  block/.style={draw,rounded corners,align=center,text width=2.25cm,minimum height=1.05cm,inner sep=4pt,font=\scriptsize},
+  wide/.style={draw,rounded corners,align=center,text width=2.55cm,minimum height=1.05cm,inner sep=4pt,font=\scriptsize},
+  arrow/.style={-{Latex[length=2mm]},thick}
+]
+\node[block] (folds) {Official CPAISD folds\\92 / 10 / 10 studies};
+\node[block,right=of folds] (features) {Metadata features\\Separate decoded-pixel track};
+\node[wide,right=of features] (fit) {Fit on clean training\\Calibrate study alerts on validation};
+\node[wide,right=of fit] (test) {Clean test, benign controls\\and controlled attack copies};
+\node[block,right=of test] (detect) {Metadata SHA-256\\Rules / IF / AE\\Cross-layer layout\\Pixel residual / SHA};
+\node[wide,right=of detect] (report) {Study alerts and metrics\\Pixel maps\\Per-alert explanations};
+\draw[arrow] (folds.east) -- (features.west);
+\draw[arrow] (features.east) -- (fit.west);
+\draw[arrow] (fit.east) -- (test.west);
+\draw[arrow] (test.east) -- (detect.west);
+\draw[arrow] (detect.east) -- (report.west);
+\end{tikzpicture}
+\caption{Research workflow with metadata and pixel tracks, reference-free layout checks, validation-calibrated study alerts, controlled edits, and per-alert explanations.}
+\label{fig:pipeline}
+\end{figure*}
+
+\subsection{Dataset and split}
+CPAISD contains 112 anonymized hyperacute ischemic-stroke NCCT studies. The official folds contain 92 training studies (8,376 DICOM instances), 10 validation studies (980 instances), and 10 test studies (809 instances) \cite{umerenkov2025}. The selector retained all studies in the three official folds and reported zero nonempty PatientID overlap across folds. In this run, the observed counts were 8,376, 980, and 809 readable files, respectively; all were reported as CT, with 92/10/10 unique studies and series. The metadata models use headers only and do not use stroke annotations. The separate pixel experiment decodes PixelData only for the 809 test instances and their synthetic copies.
+
+\subsection{Metadata representation}
+For each DICOM instance $x_i$, the implementation extracts numeric attributes (including rows, columns, bit depth, slice thickness, spacing between slices, rescale parameters, KVP, and tube current) and presence/length features for selected text fields (including PatientID, PatientName, StudyDescription, SeriesDescription, ProtocolName, Modality, Manufacturer, PhotometricInterpretation, and BodyPartExamined). Manufacturer, Modality, PhotometricInterpretation, and BodyPartExamined are also represented categorically. Patient identifiers and names are not retained as raw text in the feature vector; non-category text contributes only presence and length. In the inspected test fold, PatientID, PatientName, StudyDescription, and SeriesDescription were absent from all 809 files; ProtocolName and InstitutionName were present as ``Anonymized'' in all files, while Manufacturer had two values. Thus the PatientID and StudyDescription scripts in the original run inserted previously absent attributes rather than replacing existing identifiers or descriptions. Missing or nonnumeric values are mapped to defaults in the current implementation, which can conflate a genuine zero with a missing value.
+
+\subsection{Cryptographic comparator}
+The implementation recursively serializes main-dataset and file-meta (group 0002) DICOM elements by tag, converts values to strings, excludes PixelData (7FE0,0010) and group-length elements, and serializes the resulting mapping as sorted compact UTF-8 JSON. The SHA-256 digest for instance $i$ is
+\begin{equation}
+h_i = \mathrm{SHA256}(\mathrm{JSON}_{\mathrm{canonical}}(M_i)),
+\end{equation}
+where $M_i$ denotes the parsed metadata elements. A reference manifest maps each relative file path to a clean metadata digest and records SOP, Study, and Series Instance UIDs. Detection flags a mismatch if the path is absent from the manifest or the recalculated digest differs. This is a reference comparison, not a digital signature: the manifest must be protected independently, and this experiment creates it directly from the held-out clean test objects. Therefore, clean-control FPR for the hash comparator is zero by construction, and its perfect detection of file-level edits is expected. The manifest should be access-controlled because its DICOM UIDs remain linkable identifiers even though the image cohort is anonymized.
+
+\subsection{Structural rules}
+Rules flag missing required attributes (SOPClassUID, SOPInstanceUID, StudyInstanceUID, SeriesInstanceUID, Modality, Rows, Columns), non-CT modality, nonpositive image dimensions, invalid or nonpositive two-value PixelSpacing, nonpositive SliceThickness when present, and a SeriesInstanceUID associated with more than one StudyInstanceUID in the evaluated directory. The final rule is series-contextual: one inconsistent instance can cause other instances in its series to be flagged. The current attack log, however, marks only files actually edited as positives. This mismatch is material for the UID-inconsistency result and is discussed in Section~\ref{sec:limitations}.
+
+\subsection{Header-to-pixel layout consistency}
+A separate reference-free check compares pixel-layout declarations in the header with the pixel payload. It validates positive Rows, Columns, SamplesPerPixel, NumberOfFrames, and bit-depth fields; checks that uncompressed PixelData length agrees with declared dimensions; decodes PixelData and compares array shape with the header; and checks decoded values against the declared BitsStored and PixelRepresentation range. For compressed transfer syntaxes, the raw byte-length check is skipped while decoded shape and value checks remain. This detects structural contradictions between header and payload, not subtle semantic changes to otherwise valid pixels.
+
+\subsection{Isolation Forest}
+The Isolation Forest uses $300$ trees and is fit to the dense DictVectorizer output from clean training instances. It uses seed 42. Let $s_{\mathrm{IF}}(x)$ be the model's decision score, where lower values are more anomalous. Its cutoff is the first percentile of the 980 clean validation scores:
+\begin{equation}
+\tau_{\mathrm{IF}} = Q_{0.01}\left(\{s_{\mathrm{IF}}(x):x\in V\}\right), \quad
+\hat y_{\mathrm{IF}}(x)=\mathbb{1}[s_{\mathrm{IF}}(x)<\tau_{\mathrm{IF}}].
+\end{equation}
+This defines an instance-level nominal validation-tail rate, not a guaranteed 1\% study-level FPR; slices are clustered within studies.
+
+\subsection{Metadata autoencoder}
+The autoencoder uses a dense DictVectorizer and StandardScaler fit on clean training data. Its encoder has layer widths $d\rightarrow32\rightarrow16\rightarrow8\rightarrow4$ and its decoder mirrors these widths to reconstruct the $d$-dimensional input; hidden layers use ReLU activations. It is trained for 40 epochs with batch size 32, Adam at learning rate $10^{-3}$, and mean squared reconstruction loss. For standardized feature vector $z_i$, reconstruction error is
+\begin{equation}
+e_i = \frac{1}{d}\lVert z_i - f_{\theta}(z_i)\rVert_2^2.
+\end{equation}
+The classification threshold is the 99th percentile of clean validation errors, and an instance is anomalous when $e_i>\tau_{\mathrm{AE}}$.
+
+Prediction records include the detector sources, structural-rule findings, anomaly scores and thresholds, and the autoencoder's highest feature-wise squared reconstruction errors. These contributions indicate which encoded dimensions contributed most to reconstruction loss; they are diagnostic associations, not causal explanations. A hash mismatch confirms a difference from its reference but cannot identify the changed tag.
+
+\subsection{Controlled modifications and hybrid decision}
+The original metadata run generated six attack variants on copies of the clean test directory. For each type, 20\% of test studies (2 of 10) were selected with seed 42; because the same seed and ordered input were used, the same two studies were selected across attack variants. The PatientID and StudyDescription conditions inserted those absent attributes; PixelSpacing values were multiplied by 1.7; ProtocolName was removed when present; and Modality was changed from CT to MR. The first five conditions each produced 177 changed files. The UID-inconsistency variant changed one instance per selected series, or two instances total. Its file-level ground truth marks only those two files positive. A subsequent extension added two same-length substitutions on fields that are populated in CPAISD: a deterministic character substitution in ProtocolName (10 characters) and Manufacturer (7 or 18 characters), each preserving the original string length and producing 177 modified files.
+
+The adaptive-evasion experiment gives the attacker knowledge of the feature map and selects a same-length ProtocolName substitution. The feature extractor records ProtocolName presence and length but not its content, so the experiment measures an explicit feature-collision attack against learned detectors while retaining the trusted-reference hash as a control. This is a white-box feature-map evasion test, not optimization over arbitrary fields or unknown detector architectures.
+
+Let $m_i$, $r_i$, $u_i$, and $a_i$ be the hash, rule, Isolation Forest, and autoencoder binary outputs. The hybrid decision is
+\begin{equation}
+\hat y_{\mathrm{H}}(x_i)=m_i\lor r_i\lor u_i\lor a_i.
+\end{equation}
+An OR rule ensures the hybrid includes any detection from a component, but cannot be expected to improve over a perfect reference hash in this threat model and can increase false alarms.
+
+\subsection{Separate pixel-integrity experiment}
+The pixel experiment uses the clean 809-instance test fold and creates a second copy for each of three deterministic, pixel-only conditions. For each attack, the same seed (42) selects 20\% of the ten studies (two studies). The localized-patch condition adds 32 to a central $5\times5$ patch in each slice of the selected studies (177 files). The low-amplitude condition adds 1 to a seeded random 1\% of stored pixel values in each selected slice (177 files). The slice-inconsistency condition adds 8 to a central $5\times5$ patch in one sorted slice per selected series (two files in this cohort). Modifications are applied to copies; original CPAISD files are not edited. Values are changed in the stored integer domain without applying RescaleSlope or RescaleIntercept, so the parameters are not expressed as Hounsfield-unit changes.
+
+For clean pixel array $P_i$ and its edited copy $P_i'$, the pointwise difference map is
+\begin{equation}
+D_i(u,v)=\left|P_i'(u,v)-P_i(u,v)\right|.
+\end{equation}
+The implementation records the changed-pixel count and fraction, mean absolute difference (MAE), root-mean-square difference (RMSE), and maximum absolute difference. Representative figures show the clean slice, modified slice, and $D_i$; the difference image is scaled per example for visibility. Packed binary masks record the pixels actually changed by each synthetic edit. For a descriptive alignment check, the mask is compared with the reference-derived map $\mathbb{1}[D_i(u,v)>0]$. Because this thresholded map is computed from the exact same clean/edited pair, its overlap is a procedural consistency check, not a detector's localization performance. The integrity comparator computes SHA-256 over raw DICOM PixelData and compares it with a per-file clean-test digest. Metadata SHA-256, which excludes PixelData, serves as a negative control. The no-reference anomaly baseline is evaluated separately below.
+
+\subsection{No-reference pixel anomaly baseline}
+The no-reference detector operates on each image independently and never reads a clean counterpart or a pixel hash during prediction. Each image is robustly scaled using its 1st and 99th intensity percentiles, partitioned into non-overlapping $16\times16$ patches, and represented by six local intensity/texture features: mean, standard deviation, horizontal and vertical mean absolute gradients, high-deviation fraction, and log-scaled standard deviation. An Isolation Forest with 100 trees is fit to 50,000 randomly sampled clean patches from 2,084 training slices. Two thresholds are calibrated on clean validation data: the 1st percentile of validation patch scores for pixel-map blocks, and the 1st percentile of per-image minimum patch scores for image alarms. The saved synthetic masks are used only for evaluation. Predicted localization is blockwise at $16\times16$ resolution, so localization metrics reflect this coarse grid and the specified synthetic attacks.
+
+A second no-reference comparator computes a $5\times5$ median-filter residual $R_i=|I_i-\operatorname{MedianFilter}_{5\times5}(I_i)|$ on each independently normalized image. Its pixel threshold is the 99.9th percentile of clean validation residual samples. Its image alarm score is the 99.9th percentile residual within an image, thresholded at the 99th percentile of these image scores on clean validation data. This comparator is a simple high-frequency baseline; neither its prediction nor calibration uses a clean test counterpart.
+
+\subsection{Study-level conformal calibration}
+To calibrate alerts at the unit of use, slice scores are aggregated per baseline-keyed study using maximum anomaly severity: $-s_{\mathrm{IF}}$ for Isolation Forest and reconstruction error for the autoencoder. For a test-study score $q$, the conformal tail probability is
+\begin{equation}
+p(q)=\frac{1+\sum_{j=1}^{n_v}\mathbb{1}[q_j^{(v)}\ge q]}{n_v+1},
+\end{equation}
+where $q_j^{(v)}$ are clean validation-study scores. An alert is emitted when $p(q)\le\alpha$. With ten validation studies, the smallest attainable $p$-value is $1/11\approx0.091$; nominal levels below this cannot emit an alert under this calibration.
+
+\subsection{Severity sweep and combined conditions}
+The severity sweep uses three predefined settings. The subtle setting applies a $3\times3$ patch with increment 1, a seeded 0.1\% sparse perturbation with increment 1, and the same patch operation to one slice per selected series. The default setting uses the primary attack parameters described above. The stronger setting uses a $9\times9$ patch with increment 32, a seeded 5\% sparse perturbation with increment 2, and a $9\times9$ slice patch with increment 32. These increments apply to stored integer values, not HU.
+
+Four combined conditions pair PatientID insertion or Modality metadata edits with localized-patch or low-amplitude pixel edits. In the initial run, both generators used seed 42 and selected the same two studies, so the two hash checks each covered the full positive set. A corrected rerun used seed 42 for metadata selection and seed 44 for pixel selection; the selected study pairs were disjoint. This produced metadata-only, pixel-only, and union-positive files. Metadata and pixel SHA-256 are scored separately against the original clean test reference, and their OR is reported as a reference-based combined comparator. This does not test learned fusion or performance without a trusted reference. An external-evaluation script is also provided for CPAISD-trained metadata models on a separately acquired DICOM cohort; no external cohort results are reported because such a dataset was not present for this run.
+
+\subsection{Evaluation protocol}
+Models were fit using clean training data only. Thresholds were chosen from clean validation data only. A metadata baseline was generated for each clean test file, then used for clean-control evaluation and for all attacked copies. The attack log supplied file-level labels. For each attack and method, accuracy, precision, recall, F1, specificity, false-positive rate, and confusion counts were computed. The original six-condition macro averages give each of those attack conditions equal weight; the two later same-length experiments are reported separately and are not included in those macro results. Clean-test false-positive rates were computed separately at file and study level. A seed-sensitivity extension repeats four representative attacks with seeds 42, 43, and 44. It reports per-run results and 2,000-resample percentile bootstrap intervals, resampling the immutable baseline-keyed study (or series) as the cluster. These intervals describe only the ten-study test fold and are not external-population uncertainty estimates.
+
+\begin{table}[t]
+\caption{Metrics used in the experiment.}
+\label{tab:metrics}
+\centering\footnotesize
+\begin{tabular}{ll}
+\toprule
+Metric & Definition \\
+\midrule
+Precision & $TP/(TP+FP)$ \\
+Recall & $TP/(TP+FN)$ \\
+F1 & $2PR/(P+R)$ \\
+Specificity & $TN/(TN+FP)$ \\
+FPR & $FP/(FP+TN)=1-\mathrm{specificity}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Results and Experiments}
+\subsection{Dataset description}
+The full official CPAISD folds were used: 92 train studies/8,376 files, 10 validation studies/980 files, and 10 test studies/809 files. Metadata inspection found only Modality=CT in each fold, and the number of unique series equaled the number of studies. All 809 clean test instances were retained for each of six original metadata attack conditions. Five attack variants produced 177 positives each; the UID-inconsistency variant produced two file-level positives. Thus the six original condition tables contain $6\times809=4,854$ file-condition observations and 887 positive file labels. The two additional same-length conditions each contain 809 observations and 177 positives. These are repeated test files under different attack conditions, not independent patients or studies.
+
+\subsection{Ablation and quantitative results}
+Table~\ref{tab:macro} gives the report's unweighted macro-average across six attack types at instance level. SHA-256 is perfect under the per-file reference setup. Among learned methods, the autoencoder has higher macro F1 than Isolation Forest (0.506 versus 0.116), but with a clean-test file FPR of 0.138. The hybrid reaches macro recall 1.000 and macro F1 0.635, while its FPR rises to 0.207. This is not evidence that the OR fusion is superior to a trusted hash: the hash component itself is expected to detect every changed metadata instance, and the OR rule inherits autoencoder false positives.
+
+\begin{table}[t]
+\caption{Macro-averaged instance-level results across the six attack types. Values are from the generated report; each attack type receives equal weight.}
+\label{tab:macro}
+\centering\footnotesize
+\begin{tabular}{lrrrrr}
+\toprule
+Method & Acc. & Prec. & Rec. & F1 & FPR \\
+\midrule
+SHA-256 reference & 1.000 & 1.000 & 1.000 & 1.000 & 0.000 \\
+Structural rules & 0.818 & 0.169 & 0.333 & 0.170 & 0.036 \\
+Isolation Forest & 0.837 & 0.167 & 0.089 & 0.116 & 0.000 \\
+Autoencoder & 0.825 & 0.408 & 0.667 & 0.506 & 0.171 \\
+IF + autoencoder & 0.825 & 0.408 & 0.667 & 0.506 & 0.171 \\
+Rules + IF & 0.838 & 0.335 & 0.423 & 0.287 & 0.036 \\
+OR hybrid & 0.826 & 0.512 & 1.000 & 0.635 & 0.207 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The macro-average obscures substantial variation by attack. Table~\ref{tab:attack} reports per-attack recall and FPR for the principal comparators. Rule-based validation detected the Modality-to-MR edit, but not the PatientID, StudyDescription, PixelSpacing, or ProtocolName edits. Isolation Forest detected 53.7\% of PixelSpacing file edits and no PatientID, description, protocol, or modality edits. The autoencoder detected all file edits for four of the five whole-study attack types, but did not detect the modality edit and produced false alarms on clean files. Hash comparison detected all edited files, as expected under the constructed reference protocol.
+
+The original PatientID and StudyDescription conditions should be interpreted as insertion attacks because these tags were missing throughout the test fold. To probe whether feature length alone explains anomaly-model response, two additional same-length substitutions were run using populated fields. For both conditions the autoencoder retained its 17.72\% observed FPR on unmodified files; it detected all 177 Manufacturer substitutions but none of the 177 ProtocolName substitutions. Structural rules and Isolation Forest detected neither. These outcomes are descriptive for the chosen deterministic substitutions and do not establish robustness to other plausible edits.
+
+\begin{table}[t]
+\caption{Additional same-length metadata substitution results at file level. Entries are recall/FPR.}
+\label{tab:samelength}
+\centering\footnotesize
+\begin{tabular}{lrrrr}
+\toprule
+Attack & $n_+$ & SHA-256 & Isolation Forest & Autoencoder \\
+\midrule
+ProtocolName substitution & 177 & 1.00/0.00 & 0.00/0.00 & 0.00/0.177 \\
+Manufacturer substitution & 177 & 1.00/0.00 & 0.00/0.00 & 1.00/0.177 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Feature-aware adaptive evasion}
+In the feature-aware attack, 177 ProtocolName values were changed while preserving string length. The feature vectors were exactly unchanged for all 177 modified files. Metadata SHA-256 detected 177/177 changes; structural rules, Isolation Forest, and the autoencoder detected 0/177 each. The Isolation Forest score and autoencoder reconstruction error changed by exactly zero on average, and all three non-hash detectors were evaded on every modified file. This is a direct consequence of omitting ProtocolName content from the engineered feature map, rather than evidence of a novel attack optimizer. It demonstrates a concrete blind spot in this configuration: unsupervised models cannot detect information discarded before model input.
+
+\subsection{Header-to-pixel layout consistency}
+The reference-free layout checker produced no findings on the 809 clean test files. It flagged all 177 files in the Rows mismatch condition and all 177 in the Columns mismatch condition, with no false positives. The findings were the expected PixelData-length contradiction and pixel-decoding failure. It also flagged none of the 809 pixel-only low-amplitude negative-control files, which preserve declared dimensions and payload layout.
+
+\begin{table}[t]
+\caption{Header-to-pixel layout consistency results. Pixel-only edits are a negative control because their declared layout remains consistent.}
+\label{tab:crosslayer}
+\centering\scriptsize
+\begin{tabular}{lrrrr}
+\toprule
+Condition & Files & Positive files & Recall & FPR \\
+\midrule
+Clean control & 809 & 0 & -- & 0.000 \\
+Rows declared $+1$ & 809 & 177 & 1.000 & 0.000 \\
+Columns declared $+1$ & 809 & 177 & 1.000 & 0.000 \\
+Pixel-only negative control & 809 & 0 & -- & 0.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These are clear but deliberately obvious layout contradictions. They do not show that the checker can identify plausible but incorrect metadata values that remain compatible with the encoded payload.
+
+\begin{table*}[t]
+\caption{Per-attack instance-level recall / FPR. $^{\dagger}$ In the UID-inconsistency condition, only edited files are labeled positive while the structural rule operates at series level; see Section~\ref{sec:limitations}.}
+\label{tab:attack}
+\centering\scriptsize
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{lrrrrrr}
+\toprule
+Attack & $n_+$ & SHA-256 & Rules & IF & AE & OR hybrid \\
+\midrule
+PatientID & 177 & 1.00/0.00 & 0.00/0.00 & 0.00/0.00 & 1.00/0.18 & 1.00/0.18 \\
+Study description & 177 & 1.00/0.00 & 0.00/0.00 & 0.00/0.00 & 1.00/0.18 & 1.00/0.18 \\
+Pixel spacing & 177 & 1.00/0.00 & 0.00/0.00 & 0.54/0.00 & 1.00/0.18 & 1.00/0.18 \\
+UID inconsistency$^{\dagger}$ & 2 & 1.00/0.00 & 1.00/0.22 & 0.00/0.00 & 0.00/0.14 & 1.00/0.36 \\
+Protocol removal & 177 & 1.00/0.00 & 0.00/0.00 & 0.00/0.00 & 1.00/0.18 & 1.00/0.18 \\
+Modality change & 177 & 1.00/0.00 & 1.00/0.00 & 0.00/0.00 & 0.00/0.18 & 1.00/0.18 \\
+\bottomrule
+\end{tabular}\\
+\end{table*}
+
+\subsection{Series-level UID evaluation}
+The UID inconsistency attack changes one instance in each of two selected series. When predictions and labels are aggregated at the series level using the immutable clean baseline SeriesInstanceUID, the rule detector identifies both affected series with no false-positive series (recall 1.000, FPR 0.000). At file level, the same contextual rule flags 177 neighboring/affected instances while only two edited files are labeled positive, yielding 175 label-granularity false positives. The series-level result is the appropriate unit for this event; it still reflects a synthetic rule violation in a ten-series test fold.
+
+\begin{table}[t]
+\caption{Series-level metrics for the UID-inconsistency attack (10 original series).}
+\label{tab:uidseries}
+\centering\footnotesize
+\begin{tabular}{lrrr}
+\toprule
+Method & Positive series recalled & Recall & FPR \\
+\midrule
+SHA-256 reference & 2/2 & 1.000 & 0.000 \\
+Structural rules & 2/2 & 1.000 & 0.000 \\
+Isolation Forest & 0/2 & 0.000 & 0.000 \\
+Autoencoder & 0/2 & 0.000 & 0.125 \\
+OR hybrid & 2/2 & 1.000 & 0.125 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On untouched test files, the hash, rule, Isolation Forest, and rules-plus-IF methods had observed file FPR 0. The autoencoder and hybrid had observed file FPR 0.1384. At study level, the autoencoder and hybrid flagged 1 of 10 untouched studies (0.10), while the other listed methods flagged none. These are point estimates from ten studies and are not precise population estimates. The clean hash FPR is predetermined by reuse of the same original files to construct the reference.
+
+\begin{table}[t]
+\caption{Observed false-positive rates on the ten untouched test studies.}
+\label{tab:cleanfpr}
+\centering\footnotesize
+\begin{tabular}{lrr}
+\toprule
+Method & File-level FPR & Study-level FPR \\
+\midrule
+SHA-256 reference & 0.000 & 0.000 \\
+Structural rules & 0.000 & 0.000 \\
+Isolation Forest & 0.000 & 0.000 \\
+Autoencoder & 0.138 & 0.100 \\
+IF + autoencoder & 0.138 & 0.100 \\
+Rules + IF & 0.000 & 0.000 \\
+OR hybrid & 0.138 & 0.100 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Seed sensitivity and study-cluster uncertainty}
+Four representative metadata attacks were repeated with study-selection seeds 42, 43, and 44, keeping the same ten-study test fold, trained models, and validation thresholds. Each seed selected two studies; modified-file counts varied with the selected studies' slice counts. At study level, structural rules recalled both selected studies for modality and UID inconsistency in all three runs; Isolation Forest recalled both for PixelSpacing; and the autoencoder recalled both for the Manufacturer same-length edit. It did not detect the modality or UID edits. Table~\ref{tab:seed_sensitivity} reports the mean study-level autoencoder FPR and its stratified 95\% percentile bootstrap interval, resampling baseline-keyed studies within the positive and negative strata and averaging over seeds.
+
+\begin{table}[t]
+\caption{Study-level recall across three study-selection seeds and autoencoder study-level FPR with stratified 95\% study-bootstrap interval.}
+\label{tab:seed_sensitivity}
+\centering\scriptsize
+\begin{tabular}{lrrrr}
+\toprule
+Attack & Rules recall & IF recall & AE recall & AE FPR [95\% CI] \\
+\midrule
+Modality & 1.000 & 0.000 & 0.000 & 0.125 [0.000, 0.250] \\
+PixelSpacing & 0.000 & 1.000 & 1.000 & 0.125 [0.000, 0.250] \\
+Manufacturer substitution & 0.000 & 0.000 & 1.000 & 0.125 [0.000, 0.292] \\
+UID inconsistency & 1.000 & 0.000 & 0.000 & 0.125 [0.000, 0.250] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The corresponding positive-unit recall intervals were degenerate at 0 or 1 because each detector made the same binary decision for both attacked studies across these three selections. This stability is conditional on one small test fold and deterministic attack scripts; the bootstrap does not create additional independent patients or support cross-site inference. The hash and OR hybrid are omitted from the table because their results follow directly from the per-file clean reference and inherit that construction.
+
+\subsection{Study-level conformal alert calibration}
+The clean validation fold contains ten studies, so its smallest attainable conformal $p$-value is 0.091. At nominal $\alpha=0.10$, the clean-test study FPR was 0.000 for Isolation Forest and 0.100 for the autoencoder. Across the three study-selection seeds, the calibrated Isolation Forest detected the two positive PixelSpacing studies in each seed (recall 1.000, FPR 0.000); the autoencoder detected the Manufacturer and PixelSpacing studies (recall 1.000 for each) but missed the Modality and UID events. The autoencoder's mean study FPR was 0.125 across attacked conditions. Table~\ref{tab:conformal_study} gives the mean across seeds. At $\alpha=0.05$, no studies could be flagged because this level is below the available $p$-value resolution. At $\alpha=0.20$, clean-test study FPR rose to 0.300 for Isolation Forest and 0.600 for the autoencoder. These results show the practical limit imposed by only ten validation studies; the nominal level does not ensure a population false-alarm guarantee.
+
+\begin{table}[t]
+\caption{Mean study-level recall/FPR at conformal $\alpha=0.10$ across three study-selection seeds.}
+\label{tab:conformal_study}
+\centering\scriptsize
+\begin{tabular}{lrr}
+\toprule
+Attack & Isolation Forest & Autoencoder \\
+\midrule
+Modality & 0.000/0.000 & 0.000/0.125 \\
+PixelSpacing & 1.000/0.000 & 1.000/0.125 \\
+Manufacturer substitution & 0.000/0.000 & 1.000/0.125 \\
+UID inconsistency & 0.000/0.000 & 0.000/0.125 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Benign-like changes versus scripted attacks}
+Three predeclared benign-like transformations were applied to copies of all 809 clean test instances: updating the file-meta ImplementationVersionName, performing a limited privacy-field cleanup proxy with de-identification markers, and reserializing through pydicom without a requested attribute edit. These transformations are experimental proxies, not outputs from a named PACS or a complete standards-conformant de-identification process. The audit found unchanged PixelData and unchanged non-target clinical attributes in all 809 files for each condition. The canonical metadata digest changed for all files in the first two conditions and for none in the reserialization condition.
+
+For each benign-like condition, alarm rate is the fraction of files flagged after transformation. The new-alarm rate counts only files that were not flagged in the corresponding untouched clean test file. This distinction matters for the autoencoder: it flagged 112/809 files (0.138) in each condition, but these were the same pre-existing clean-test alarms, so none were newly triggered by the transformation. The OR hybrid retained those 112 baseline alarms; it additionally flagged files when the strict metadata hash detected an actual covered metadata change. On the six existing scripted attack conditions, macro recall is the unweighted mean of file-level recall across attack types. All values are descriptive for these transformations and this test fold; the labels encode how the files were edited, not intent or clinical harm.
+
+\begin{table*}[t]
+\caption{Detector alarms on benign-like transformations and macro recall on six scripted metadata attacks. Benign cells show alarm rate/new-alarm rate relative to untouched files.}
+\label{tab:benign}
+\centering\scriptsize
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lrrrr}
+\toprule
+Method & File-meta update & Privacy cleanup proxy & Re-serialization & Attack macro recall \\
+\midrule
+Metadata SHA-256 & 1.000/1.000 & 1.000/1.000 & 0.000/0.000 & 1.000 \\
+Structural rules & 0.000/0.000 & 0.000/0.000 & 0.000/0.000 & 0.333 \\
+Isolation Forest & 0.000/0.000 & 0.000/0.000 & 0.000/0.000 & 0.089 \\
+Autoencoder & 0.138/0.000 & 0.138/0.000 & 0.138/0.000 & 0.670 \\
+Metadata OR hybrid & 1.000/0.861 & 1.000/0.861 & 0.138/0.000 & 1.000 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Pixel-integrity results}
+Table~\ref{tab:pixelresults} summarizes the independent pixel experiment. The reference PixelData hash flagged every edited file in all three conditions (177/177, 177/177, and 2/2) and produced no mismatches among untouched files. This perfect result is expected because the exact clean file is the reference. As a negative control, the metadata hash flagged none of the pixel-only edits. Its zero recall is expected because the edited files' metadata was unchanged; the resulting accuracy is dominated by the majority of unedited files and should not be read as useful pixel-attack performance.
+
+The low-amplitude condition changed approximately 1\% of stored pixel values with a mean absolute difference of approximately 0.010 stored-value units per edited image. The localized-patch and single-slice conditions changed approximately 0.0095\% of pixels on average, with mean absolute differences of 0.00305 and 0.000763, respectively. These values are computed in the stored integer domain and are not HU-based measures. They describe these scripted edits only.
+
+\begin{table*}[t]
+\caption{File-level results for the separate pixel-integrity experiment. Hash entries are recall/FPR; difference summaries are averaged over edited files.}
+\label{tab:pixelresults}
+\centering\footnotesize
+\begin{tabular}{lrrrrrr}
+\toprule
+Attack & $n_+$ & Pixel SHA-256 & Metadata SHA-256 & Changed-pixel fraction & MAE & Max. difference \\
+\midrule
+Localized patch & 177 & 1.00/0.00 & 0.00/0.00 & 0.00009537 & 0.003052 & 32 \\
+Low-amplitude perturbation & 177 & 1.00/0.00 & 0.00/0.00 & 0.00999832 & 0.009998 & 1 \\
+Slice inconsistency & 2 & 1.00/0.00 & 0.00/0.00 & 0.00009537 & 0.000763 & 8 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{No-reference pixel anomaly results}
+The clean-trained patch Isolation Forest used 50,000 patches sampled from 2,084 training files, with thresholds calibrated from 980 validation files. On 809 clean test files, the observed image-level false-positive rate was 0.0111 and the pixel-map false-positive fraction was 0.0191. The detector did not identify any attacked image at its calibrated image threshold across the three synthetic attack conditions. Its pixel-level localization was weak: for low-amplitude edits, precision was 0.0100, recall 0.0052, and IoU 0.0034; localized-patch and slice-inconsistency localization had zero recall. The second, $5\times5$ median-filter residual comparator had an 8.78\% clean-test image alarm rate and a 0.0125\% pixel-map alarm fraction. In attacked conditions, it detected 6.21\% of localized-patch images and 5.65\% of low-amplitude images, but also flagged 9.65\% of unmodified files in those conditions; it detected no slice-inconsistency images. Pixel-mask IoU was zero for localized and slice edits and 0.00012 for the low-amplitude edits. Thus neither no-reference baseline provided useful localization, and the residual comparator's modest image recall came with a high false-alarm rate. These findings show that the simple image-only baselines did not reliably detect the tested edits at their validation-calibrated operating points. The results are negative but informative: a no-reference detector is a harder problem than exact-reference hashing, and synthetic changed-pixel masks do not guarantee separability from normal CT texture.
+
+\begin{table}[t]
+\caption{No-reference pixel detector performance. File FPR uses all 809 attacked-condition files; localization metrics aggregate only modified instances against their synthetic masks.}
+\label{tab:noref}
+\centering\scriptsize
+\begin{tabular}{lrrrr}
+\toprule
+Attack & IF recall/FPR & Residual recall/FPR & IF pixel IoU & Residual pixel IoU \\
+\midrule
+Localized patch & 0.000/0.014 & 0.062/0.097 & 0.00000 & 0.00000 \\
+Low-amplitude & 0.000/0.014 & 0.056/0.097 & 0.00343 & 0.00012 \\
+Slice inconsistency & 0.000/0.011 & 0.000/0.088 & 0.00000 & 0.00000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The clean-test file FPRs for the patch Isolation Forest and median residual comparator were 0.0111 and 0.0878, respectively. The latter's validation-calibrated 99th-percentile image threshold did not transfer to the clean test fold at the nominal tail rate. Its very small pixel-map FPR does not translate to useful localization because the synthetic edits are tiny relative to normal local image residuals. For each attack condition, unchanged copies have the same no-reference scores as their clean counterparts.
+
+\begin{figure*}[t]
+\centering
+\begin{minipage}[t]{0.32\textwidth}\centering
+\includegraphics[width=\linewidth]{pixel_localized_patch.png}\\[-2pt]
+\scriptsize (a) Localized patch
+\end{minipage}\hfill
+\begin{minipage}[t]{0.32\textwidth}\centering
+\includegraphics[width=\linewidth]{pixel_low_amplitude.png}\\[-2pt]
+\scriptsize (b) Low-amplitude perturbation
+\end{minipage}\hfill
+\begin{minipage}[t]{0.32\textwidth}\centering
+\includegraphics[width=\linewidth]{pixel_slice_inconsistency.png}\\[-2pt]
+\scriptsize (c) Slice inconsistency
+\end{minipage}
+\caption{Representative clean slice, modified copy, and absolute pixel-difference maps generated by the experiment. The difference scale is adjusted per example for visualization. These are reference-based visualizations, not outputs from an automated localization detector.}
+\label{fig:pixelheatmaps}
+\end{figure*}
+
+\subsection{Severity and mask-alignment results}
+Across all nine attack/severity combinations, PixelData SHA-256 achieved file-level recall 1.000 and FPR 0.000 against the per-file clean reference. The metadata hash achieved recall 0.000 on pixel-only conditions, as expected. Table~\ref{tab:severity} reports the perturbation magnitudes. The hash result does not vary with severity because any changed PixelData bytes produce a digest mismatch; this experiment does not establish the smallest perceptually or clinically meaningful change that could be detected.
+
+The reference-difference mask alignment yielded precision, recall, F1, and IoU of 1.000 for each of the three attack types. This is expected by construction: both the predicted region ($D_i>0$) and the target mask identify the pixels changed by the same script. These scores validate mask and difference-map bookkeeping; they must not be interpreted as localization performance on unknown tampering.
+
+\begin{table*}[t]
+\caption{Pixel attack severity summary. Changed-pixel fraction and MAE are averaged across modified files; the hash columns show file-level recall/FPR.}
+\label{tab:severity}
+\centering\scriptsize
+\begin{tabular}{llrrrr}
+\toprule
+Attack & Severity / parameters & $n_+$ & Changed-pixel fraction & MAE & Pixel SHA-256 recall/FPR \\
+\midrule
+Localized patch & Subtle: $3\times3$, $+1$ & 177 & 0.000034 & 0.000034 & 1.00/0.00 \\
+Localized patch & Default: $5\times5$, $+32$ & 177 & 0.000095 & 0.003052 & 1.00/0.00 \\
+Localized patch & Stronger: $9\times9$, $+32$ & 177 & 0.000309 & 0.009888 & 1.00/0.00 \\
+Sparse perturbation & Subtle: 0.1\%, $+1$ & 177 & 0.000999 & 0.000999 & 1.00/0.00 \\
+Sparse perturbation & Default: 1\%, $+1$ & 177 & 0.009998 & 0.009998 & 1.00/0.00 \\
+Sparse perturbation & Stronger: 5\%, $+2$ & 177 & 0.049999 & 0.099998 & 1.00/0.00 \\
+Slice inconsistency & Subtle: $3\times3$, $+1$ & 2 & 0.000034 & 0.000034 & 1.00/0.00 \\
+Slice inconsistency & Default: $5\times5$, $+8$ & 2 & 0.000095 & 0.000763 & 1.00/0.00 \\
+Slice inconsistency & Stronger: $9\times9$, $+32$ & 2 & 0.000309 & 0.009888 & 1.00/0.00 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Combined metadata-plus-pixel results}
+The corrected combined run selected metadata- and pixel-attacked studies independently (seed 42 and seed 44, respectively). For each of four attack combinations, the metadata layer changed 177 files and the pixel layer changed 133 files in two other studies, yielding 310 unique positive files across four affected studies. Metadata-only and pixel-only SHA-256 checks detected 177/310 (0.571) and 133/310 (0.429) positives, respectively; their OR detected all 310 (recall 1.000), with zero observed false positives. This demonstrates complementary coverage of two exact-reference checks under independently sampled attacks. It does not show learned multimodal fusion or performance without trusted clean references.
+
+\begin{table*}[t]
+\caption{Combined metadata-plus-pixel attack results at file level. Entries are recall/FPR against the union attack labels.}
+\label{tab:combined}
+\centering\footnotesize
+\begin{tabular}{lrrrr}
+\toprule
+Condition & $n_+$ & Metadata SHA-256 & PixelData SHA-256 & OR of hashes \\
+\midrule
+PatientID insertion + localized patch & 310 & 0.571/0.000 & 0.429/0.000 & 1.000/0.000 \\
+PatientID insertion + low-amplitude & 310 & 0.571/0.000 & 0.429/0.000 & 1.000/0.000 \\
+Modality change + localized patch & 310 & 0.571/0.000 & 0.429/0.000 & 1.000/0.000 \\
+Modality change + low-amplitude & 310 & 0.571/0.000 & 0.429/0.000 & 1.000/0.000 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Qualitative analysis}
+The attack outcomes illustrate the different operating principles. A modality change from CT to MR violates a fixed CT-only rule and is immediately detected. The original PatientID and StudyDescription scripts inserted tags that are absent in CPAISD, so their anomaly results may reflect a presence change rather than altered content. The same-length substitutions show field-dependent behavior: the autoencoder detected the Manufacturer edit but not the ProtocolName edit, despite preserved string length. This does not establish semantic detection of arbitrary plausible substitutions. PixelSpacing values remain finite and positive after multiplication by 1.7, so they pass the implemented range rule; learned-model response depends on the feature representation. For series UID inconsistency, the series-level rule flags all instances in an inconsistent series, while labels mark only the two modified files positive; neighboring slices are therefore counted as false positives at file level. Study-level grouping now uses the clean baseline UID, preventing UID edits from changing the aggregation key.
+
+The feature-aware ProtocolName attack explains the learned-detector blind spot: the same-length substitution leaves the current encoded input exactly unchanged, so all non-hash methods return the same prediction and scores as on the clean file. The header-to-pixel checker succeeds on the deliberately inconsistent dimension attacks because the declared layout conflicts with PixelData byte length and decoding. It does not flag value-only pixel edits that preserve the layout. Study-level conformal scores support a direct operating-point comparison but have only 10 calibration units; at $\alpha=0.20$, observed clean-test FPR rises sharply. Per-file explanation records list the alerting components, rule reasons, thresholds, and leading autoencoder reconstruction-error features. These are useful audit clues, but they do not establish causation or identify the exact changed tag for hash alerts.
+
+The per-attack F1 plot summarizes the metadata experiment only. Figure~\ref{fig:pixelheatmaps} shows representative pixel differences from the separate reference-based experiment; no image-content anomaly score is plotted.
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{f1_by_attack.png}
+\caption{Generated per-attack F1 plot. Hash-based performance is expected under the trusted-reference experiment.}
+\label{fig:f1}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\columnwidth]{clean_test_fpr.png}
+\caption{Observed clean-test file false-positive rates. The test contains ten studies; these point estimates have high sampling uncertainty.}
+\label{fig:fpr}
+\end{figure}
+
+\subsection{Statistical interpretation}
+The original macro-average experiment did not compute inferential tests or confidence intervals. A later seed-sensitivity extension computed stratified study/series bootstrap intervals for four attacks, but these resample only ten studies from the same CPAISD test fold. Multiple slices within a study are correlated, and attack selections across seeds reuse the same ten studies. All results are descriptive for this attack-generation protocol; neither the bootstrap nor repeated seeds provide evidence of independent-site or population-level generalization.
+
+\section{Discussion}
+The experiments now include reference-based integrity checks, no-reference pixel baselines, header-to-pixel consistency rules, a feature-aware evasion condition, and study-level calibration. Pixel SHA-256 detected each modified file at every tested strength, as expected with a clean reference. The patch-level Isolation Forest failed to detect any of the three pixel attack types at its validation-calibrated image threshold. The median residual method detected only small fractions of two attack types at a 9.65\% condition-level FPR, with negligible mask localization. The header-to-pixel rules detected all deliberately inconsistent Rows/Columns conditions and no clean or pixel-only negative-control files. The ProtocolName feature-collision attack evaded every non-hash detector on 177/177 modified files, showing the cost of representing that field only by length and presence. At the study level, conformal calibration could distinguish some tested attacks at $\alpha=0.10$, but its resolution and false-alarm estimates are limited by ten validation studies. The per-file explanations expose detector sources and reconstruction-error features but are not causal explanations.
+
+The hybrid's 100\% macro recall should not be read as a discovery that ML improves integrity protection. Since the hybrid is an OR over a SHA-256 reference check that has perfect recall by construction, its recall is inherited. Its FPR is higher than the hash-only FPR because an OR rule adds alarms from the autoencoder. Likewise, the pixel-hash result measures exact change against a trusted original; the heatmaps visualize differences using that same original and are not a no-reference detector. A more informative follow-up would compare non-hash detectors at a prespecified study-level FPR and evaluate a deployment-like setting where trusted reference availability is explicitly varied.
+
+The benign-change comparison further shows that a strict reference hash answers whether a covered value changed, not whether a change is malicious: it alarmed on the file-meta update and privacy-cleanup proxy, but not on metadata-preserving reserialization. The anomaly models did not add alarms beyond their existing clean-test flags for these conditions. The OR hybrid inherited hash alarms for the actual metadata edits. These results motivate testing documented exports from actual PACS systems before treating a hash mismatch as an operational security alarm.
+
+\section{Limitations}\label{sec:limitations}
+Several limitations constrain interpretation:
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Small, single-center cohort.} CPAISD contains 112 studies from a narrow hyperacute stroke cohort; the test fold contains only ten studies. Cross-center generalization is untested.
+  \item \textbf{Synthetic attacks and benign-like proxies.} Attack edits are deterministic scripted changes, not naturally occurring errors. In CPAISD, PatientID and StudyDescription were absent, so those conditions inserted tags rather than changing existing values. The feature-aware ProtocolName evasion is an explicit white-box feature collision, not a general adaptive attacker evaluation. The three benign-like transformations are controlled proxies; the privacy cleanup is limited, and none models a named PACS vendor or validated clinical workflow. The transformations do not establish whether a real change is harmless or malicious.
+  \item \textbf{Reference leakage by design.} The metadata manifest is generated from the exact clean test objects later used as clean controls. This makes clean hash FPR zero by construction and supports only a controlled change-detection check. The manifest is not signed by this implementation.
+  \item \textbf{Series/file label mismatch.} The UID attack changes one instance per selected series, but labels only the edited files as positive while the contextual rule flags neighboring slices. File-level false positives therefore include valid series-level detections. The corrected evaluation now reports metrics at the immutable baseline series unit, but the test contains only ten series, limiting precision of those estimates.
+  \item \textbf{Feature limitations.} Several text fields are reduced to presence and length, and unknown categorical values can be discarded by the fitted vectorizer. The autoencoder may recognize the specific engineered length/value shifts without detecting semantically wrong but statistically ordinary substitutions.
+  \item \textbf{Incomplete software provenance.} The run configuration records the seed and model parameters but not all package versions, hardware specifications, or deterministic-runtime settings. The reported elapsed time is not independently reproducible from the paper alone.
+  \item \textbf{Limited pixel evaluation.} The pixel experiment uses three deterministic synthetic edits and a per-file clean reference. The reference-difference/mask IoU is a bookkeeping check. A no-reference patch Isolation Forest had zero image-level recall on all three attack types at its calibrated threshold. The median-filter residual comparator detected only a small fraction of two attack conditions, with a clean-test image alarm rate of 8.78\% and near-zero localization. Both are simple baselines, not mature image-tamper detectors. Edits operate on stored integer values without applying the DICOM rescale transform, so they are not calibrated in HU. The pixel editor supports uncompressed single-frame 2-D integer images.
+  \item \textbf{Seed sensitivity scope.} The three-seed repeatability analysis changes which studies receive each synthetic attack but reuses the same ten-study test fold and fitted models. Its study-cluster bootstrap intervals do not account for site or population variation and may be degenerate when predictions are identical across seeds.
+  \item \textbf{Coarse study calibration.} Conformal score calibration has only ten clean validation studies, so its minimum attainable $p$-value is $1/11$. The resulting operating points are coarse and do not guarantee a population-level false-alarm rate.
+  \item \textbf{Simple cross-layer attacks.} Rows/Columns mismatch attacks create an obvious conflict between declared dimensions and payload length. The checker is not evaluated against plausible but incorrect metadata that still matches encoded layout, nor against every compressed or multiframe transfer syntax.
+  \item \textbf{Explanation limits.} Autoencoder feature contributions summarize reconstruction error in the engineered representation. They are not causal attributions, and a reference hash alone cannot identify which metadata element changed.
+  \item \textbf{Reference-based combined checks.} The independent combined run shows complementary coverage only because metadata and pixel SHA-256 digests are compared with exact clean references. It does not evaluate learned fusion, reference-free detection, or whether the clean manifest can be protected operationally. Benign-like controls show that strict digests alarm on covered metadata edits even when pixels and non-target clinical attributes are unchanged; testing with documented real PACS exports remains necessary.
+  \item \textbf{Severity interpretation.} A cryptographic hash reports any changed byte, so perfect recall across the tested perturbation strengths is an expected property of the comparator. The sweep does not estimate perceptual detectability or a minimum clinically meaningful perturbation.
+  \item \textbf{No clinical or forensic validation.} Neither track establishes clinical correctness, sender authentication, audit attribution, resistance to compromised baselines, or malicious intent.
+\end{enumerate}
+
+\section{Conclusion and Future Work}
+This paper reports exploratory metadata, reference-based pixel-integrity, no-reference pixel anomaly, cross-layer consistency, study calibration, benign-change control, adaptive-evasion, severity-sweep, and combined-edit experiments on official CPAISD folds. In the original metadata experiment, macro F1 was 1.000 for metadata SHA-256, 0.170 for structural rules, 0.116 for Isolation Forest, and 0.506 for the autoencoder; the OR hybrid achieved 0.635 macro F1 with 0.207 macro FPR. A feature-aware same-length ProtocolName edit preserved the model input in all 177 modified files and evaded each non-hash detector, while the reference hash detected all changes. Cross-layer layout rules detected all 177 Rows and Columns mismatches and had no findings on clean or pixel-only control files. At study-level conformal $\alpha=0.10$, the clean-test FPR was 0 for Isolation Forest and 0.10 for the autoencoder, with only ten validation studies available for calibration. The no-reference patch Isolation Forest did not detect the scripted pixel attacks at its calibrated image threshold; a median-residual comparator detected only 5.6--6.2\% of two image-level conditions with 9.65\% condition-level FPR and negligible localization. Pixel SHA-256 detected all edits across tested severities against the exact clean reference. Three benign-like controls preserved PixelData and non-target clinical attributes in all 809 files: the strict metadata hash alarmed on all file-meta and privacy-marker edits but not on metadata-preserving reserialization. The autoencoder's 112 clean-test alarms persisted unchanged across all three conditions. These findings remain descriptive for one ten-study test fold and do not show generalization to another dataset, robust adaptive resistance, or clinical utility.
+
+Before publication or stronger claims, the no-reference pixel model needs improved features and evaluation on more realistic pixel changes. The header-to-pixel rules should be tested on plausible metadata edits that retain a decodable payload. Adaptive evaluation should cover more fields and attackers with access to detector outputs. Study-level calibration requires many more independent validation studies. Benign control should be extended to documented PACS exports. A second DICOM cohort is required for cross-dataset evaluation; CQ500 is a candidate external head-CT cohort, but its hemorrhage population differs from CPAISD's ischemic-stroke focus and access is subject to its non-commercial license and end-user agreement \cite{linyuh2024}. The project includes an external-evaluation script, but no external data were available in this run, so no cross-dataset result is claimed. Multi-site data and study-level uncertainty estimates remain necessary.
+
+\section*{Reproducibility and Data Availability}
+The original metadata experiment used seed 42, all official CPAISD folds, a 20\% study-level attack fraction, 40 autoencoder epochs, and no cap on training or validation instances. Extensions include same-length substitutions, the ProtocolName feature-collision test, rows/columns layout inconsistencies, study-level conformal calibration, per-alert explanation fields, three benign-like transformations, and four metadata attacks under selection seeds 42, 43, and 44 with 2,000 stratified study/series bootstrap resamples. The benign-change comparison used the 809 clean test instances, a freshly generated metadata baseline, and the existing six scripted attack folders; audits confirmed unchanged PixelData and non-target clinical attributes in all benign-like conditions. The no-reference pixel baselines were calibrated using 980 validation files; the patch Isolation Forest used 50,000 patches from 2,084 clean training files. The corrected combined run used seed 42 for metadata selection and seed 44 for pixel selection; it records 177 metadata edits, 133 pixel edits, and 310 unique union positives per condition. Outputs include per-file/series/study predictions, feature-level explanations, calibration reports, pixel metrics, packed edit masks, anomaly heatmaps, severity tables, and combined-condition metrics. The external-evaluation script is provided but was not run because no external cohort was present. No vendor PACS export was available; the benign-like transformations are synthetic and are not validated workflow exports. Hardware details were not captured, so recorded elapsed time is not a portable benchmark. The project implementation and scripts are present in the authors' workspace; a public, versioned code archive has not yet been deposited. CPAISD is available from Zenodo under its dataset record; users must follow the current dataset license and citation requirements \cite{umerenkov2025,cpaisdzenodo}. No patient-level data are reproduced in this manuscript.
+
+\begin{thebibliography}{8}
+\bibitem{dicomps315}
+DICOM Standards Committee, ``DICOM PS3.15: Security and System Management Profiles,'' 2026 edition. [Online]. Available: \url{https://dicom.nema.org/medical/dicom/current/output/chtml/part15/ps3.15.html}. Accessed: Nov. 12, 2026.
+
+\bibitem{kobayashi2009}
+L. O. M. Kobayashi, S. S. Furuie, and P. S. L. M. Barreto, ``Providing integrity and authenticity in DICOM images: A novel approach,'' \emph{IEEE Trans. Inf. Technol. Biomed.}, vol. 13, no. 4, pp. 582--589, 2009, doi: 10.1109/TITB.2009.2014751.
+
+\bibitem{tan2011}
+C. K. Tan, J. C. Ng, X. Xu, C. L. Poh, Y. L. Guan, and K. Sheah, ``Security protection of DICOM medical images using dual-layer reversible watermarking with tamper detection capability,'' \emph{J. Digit. Imaging}, vol. 24, no. 3, pp. 528--540, 2011, doi: 10.1007/s10278-010-9295-4.
+
+\bibitem{dou2012}
+W. Dou, C. L. Poh, and Y. L. Guan, ``An improved tamper detection and localization scheme for volumetric DICOM images,'' \emph{J. Digit. Imaging}, vol. 25, no. 6, pp. 751--763, 2012, doi: 10.1007/s10278-012-9518-y.
+
+\bibitem{alhaj2015}
+A. Al-Haj, ``Providing integrity, authenticity, and confidentiality for header and pixel data of DICOM images,'' \emph{J. Digit. Imaging}, vol. 28, no. 2, pp. 179--187, 2015, doi: 10.1007/s10278-014-9734-8.
+
+\bibitem{oh2026}
+S. Oh, E. Lee, S. Lee, J. Park, S. Park, and G. Kim, ``Forensic detection of medical image manipulation using PACS and DICOM artifacts,'' \emph{J. Forensic Sci.}, vol. 71, no. 1, pp. 371--387, 2026, doi: 10.1111/1556-4029.70191.
+
+\bibitem{linyuh2024}
+E. Lin and E. L. Yuh, ``Semi-supervised learning for generalizable intracranial hemorrhage detection and segmentation,'' \emph{Radiology: Artificial Intelligence}, vol. 6, no. 3, Art. no. e230077, 2024, doi: 10.1148/ryai.230077. The authors describe CQ500 as an external DICOM head-CT cohort and report its CC BY-NC-SA 4.0 license and end-user agreement.
+
+\bibitem{umerenkov2025}
+D. Umerenkov, S. Kudin, M. Peksheva, and D. Pavlov, ``Core-penumbra hyperacute ischemic stroke dataset,'' \emph{Scientific Data}, vol. 12, no. 1, Art. no. 707, 2025, doi: 10.1038/s41597-025-05000-0.
+
+\bibitem{cpaisdzenodo}
+D. Umerenkov, S. Kudin, M. Peksheva, and D. Pavlov, ``CPAISD: Core-penumbra acute ischemic stroke dataset,'' Zenodo, 2024, doi: 10.5281/zenodo.10892316.
+\end{thebibliography}
+\balance
+\end{document}

@@ -1,0 +1,1 @@
+Extract CQ500 DICOM folders here. Do not place the archive ZIPs here. See README.md and DATASET_SOURCE.md.
