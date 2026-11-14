@@ -7,7 +7,7 @@ from src.dicom_io import find_dicom_files, read_dataset
 from src.fs_utils import link_or_copy
 
 def main():
-    ap = argparse.ArgumentParser(description="Select a lightweight complete-study subset from CPAISD.")
+    ap = argparse.ArgumentParser(description="Select a configurable complete-study subset from CPAISD.")
     ap.add_argument("--input", required=True, help="Extracted CPAISD root containing train, val, test")
     ap.add_argument("--output", default="data/real_ct")
     ap.add_argument("--train-studies", type=int, default=92)

@@ -1,4 +1,4 @@
-# Lightweight Brain CT DICOM Metadata Security Project
+# Brain CT DICOM Metadata and Pixel Integrity Security Research
 
 **Research title:** Detecting DICOM Metadata Tampering in Non-Contrast Brain CT: A Comparative Evaluation of Integrity, Rules, and Anomaly Detection
 
@@ -28,7 +28,7 @@ Default selection uses all official folds:
 
 The selector preserves the dataset's official train/validation/test fold boundaries and chooses whole studies, never random slices. It uses hard links when possible, so the subset does not duplicate the DICOM image bytes on the same NTFS volume.
 
-The ML models use DICOM metadata headers only. The metadata SHA-256 reference covers main-dataset and DICOM file-meta elements, excluding PixelData and group-length elements. It does not decode or hash PixelData. PixelData integrity is a separate experiment and remains disabled in the lightweight configuration.
+The metadata ML models use DICOM headers only. The metadata SHA-256 reference covers main-dataset and DICOM file-meta elements, excluding PixelData and group-length elements. The separate pixel-integrity experiment decodes and hashes PixelData; it is not part of the metadata-only training run.
 
 ## Windows setup
 
@@ -341,7 +341,7 @@ simulation of a named PACS product. Use a fresh output path for each run.
 - The main experiment is metadata manipulation detection; the separate pixel experiment does not train an image anomaly detector.
 - CPAISD is single-center and contains hyperacute ischemic stroke cases only.
 - For quick development, the selector accepts smaller `--train-studies`, `--validation-studies`, and `--test-studies` values. Such results are exploratory. Full-cohort results still need multi-center validation. Instance-level slice scores are correlated, so study-level metrics are also reported.
-- PixelData integrity hashing is disabled in the lightweight metadata run and is evaluated separately by the optional pixel experiment above.
+- PixelData integrity hashing is outside the metadata-only training run and is evaluated separately by the pixel experiment above.
 - SHA-256 comparison assumes the baseline is trusted and protected independently.
 - Anomaly scores are not proof of malicious intent.
 - This is not a clinical diagnostic or deployment-ready system.
