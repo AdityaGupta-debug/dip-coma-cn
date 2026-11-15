@@ -37,6 +37,17 @@ IF_MODEL = PROJECT_ROOT / "experiment_cpaisd" / "models" / "isolation_forest.job
 AE_MODEL = PROJECT_ROOT / "experiment_cpaisd" / "models" / "metadata_autoencoder.joblib"
 PIXEL_MODEL = PROJECT_ROOT / "experiment_cpaisd_no_reference_v2" / "no_reference_pixel_model.joblib"
 PIXEL_CALIBRATION = PROJECT_ROOT / "experiment_cpaisd_no_reference_v2" / "calibration_and_clean_summary.json"
+_completed_unet = (PROJECT_ROOT / "experiment_cpaisd_supervised_localization_512_30ep_complete"
+                  / "unet_localizer.pt")
+_unet_candidates = sorted(
+    PROJECT_ROOT.glob("experiment_cpaisd_supervised_localization*/unet_localizer.pt"),
+    key=lambda path: path.stat().st_mtime,
+    reverse=True,
+)
+_preferred_unet = PROJECT_ROOT / "experiment_cpaisd_supervised_localization" / "unet_localizer.pt"
+UNET_MODEL = (_completed_unet if _completed_unet.is_file()
+              else (_unet_candidates[0] if _unet_candidates else _preferred_unet))
+UNET_RESULTS_DIR = UNET_MODEL.parent
 
 st.set_page_config(page_title="DICOM Security Demo Lab", page_icon="🧠", layout="wide")
 
@@ -49,6 +60,79 @@ def get_dicom_paths(root_string: str) -> tuple[str, ...]:
 @st.cache_resource(show_spinner=False)
 def load_pixel_bundle(path_string: str):
     return joblib.load(path_string)
+
+
+@st.cache_resource(show_spinner="Loading the supervised pixel-localization model...")
+def load_unet_bundle(path_string: str):
+    import torch
+    from src.supervised_localization import UNetLocalizer
+
+    checkpoint = torch.load(path_string, map_location="cpu", weights_only=True)
+    config = checkpoint["config"]
+    model = UNetLocalizer(base_channels=int(config["base_channels"]))
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+    return model, config
+
+
+def unet_probability_map(dataset, model, config):
+    import torch
+    import torch.nn.functional as functional
+
+    normalized = _normalized_image(dataset)
+    image_size = int(config["image_size"])
+    tensor = torch.from_numpy(np.asarray(normalized, dtype=np.float32))[None, None]
+    tensor = functional.interpolate(tensor, size=(image_size, image_size),
+                                    mode="bilinear", align_corners=False)
+    with torch.no_grad():
+        probability = torch.sigmoid(model(tensor))[0, 0].cpu().numpy()
+    pixel_mask = probability >= float(config["pixel_threshold"])
+    return normalized, probability, pixel_mask
+
+
+def apply_copy_move_edit(path: Path, seed: int = 42) -> tuple[int, np.ndarray]:
+    """Copy a stored-pixel patch to a separate location in a temporary DICOM copy."""
+    dataset = read_dataset(path, stop_before_pixels=False)
+    array = np.asarray(dataset.pixel_array)
+    if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
+        raise ValueError(f"Copy-move demo needs a single-frame 2-D integer CT, got {array.shape} {array.dtype}.")
+    rows, columns = array.shape
+    size = max(8, round(min(rows, columns) * 0.10))
+    if rows < size * 2 or columns < size * 2:
+        raise ValueError("This slice is too small for two non-overlapping copy-move regions.")
+    rng = random.Random(seed)
+    destination = None
+    patch = None
+    changed_mask = None
+    for _ in range(200):
+        source_top = rng.randint(0, rows - size)
+        source_left = rng.randint(0, columns - size)
+        dest_top = rng.randint(0, rows - size)
+        dest_left = rng.randint(0, columns - size)
+        overlap = not (dest_top + size <= source_top or source_top + size <= dest_top
+                       or dest_left + size <= source_left or source_left + size <= dest_left)
+        if not overlap:
+            candidate_patch = array[source_top:source_top + size, source_left:source_left + size].copy()
+            candidate_target = array[dest_top:dest_top + size, dest_left:dest_left + size]
+            candidate_mask = candidate_target != candidate_patch
+            if np.any(candidate_mask):
+                destination = (dest_top, dest_left)
+                patch = candidate_patch
+                changed_mask = candidate_mask
+                break
+    if destination is None:
+        raise ValueError("Could not find a non-identical, non-overlapping copy-move patch in this slice.")
+    edited = array.copy()
+    dest_top, dest_left = destination
+    target = edited[dest_top:dest_top + size, dest_left:dest_left + size]
+    changed = int(np.count_nonzero(changed_mask))
+    target[:] = patch
+    byte_order = "<" if getattr(dataset, "is_little_endian", True) else ">"
+    dataset.PixelData = edited.astype(array.dtype.newbyteorder(byte_order), copy=False).tobytes(order="C")
+    dataset.save_as(str(path), enforce_file_format=True)
+    mask = np.zeros(array.shape, dtype=bool)
+    mask[dest_top:dest_top + size, dest_left:dest_left + size] = changed_mask
+    return changed, mask
 
 
 def apply_metadata_edit(dataset, edit_name: str) -> tuple[str, str, str]:
@@ -145,14 +229,19 @@ def run_live_demo(source_file: Path, edit_mode: str, metadata_edit: str | None,
             edit_description = f"{tag}: {old_value} -> {new_value}"
 
         changed_pixel_count = 0
+        synthetic_pixel_mask = None
         if edit_mode in {"Pixels only", "Metadata + pixels"}:
-            attack_name = "localized_patch" if pixel_edit == "Localized patch (5x5, +32)" else "low_amplitude"
-            changed_pixel_count, _ = _edit_pixels(
-                edited_file, attack_name, random.Random(42),
-                patch_size=5, patch_delta=32, sparse_fraction=0.01, sparse_delta=1,
-            )
-            pixel_description = ("5x5 central patch, +32 stored values" if attack_name == "localized_patch"
-                                 else "1% seeded sparse edit, +1 stored value")
+            if pixel_edit == "Copy-move patch (withheld U-Net family)":
+                changed_pixel_count, synthetic_pixel_mask = apply_copy_move_edit(edited_file, seed=42)
+                pixel_description = "10% patch copied to a non-overlapping location (withheld U-Net family)"
+            else:
+                attack_name = "localized_patch" if pixel_edit == "Localized patch (5x5, +32)" else "low_amplitude"
+                changed_pixel_count, synthetic_pixel_mask = _edit_pixels(
+                    edited_file, attack_name, random.Random(42),
+                    patch_size=5, patch_delta=32, sparse_fraction=0.01, sparse_delta=1,
+                )
+                pixel_description = ("5x5 central patch, +32 stored values" if attack_name == "localized_patch"
+                                     else "1% seeded sparse edit, +1 stored value")
             edit_description = (edit_description + " | " if edit_description != "No edit selected" else "") + pixel_description
 
         baseline_path = temp_root / "demo_clean_reference.json"
@@ -200,6 +289,40 @@ def run_live_demo(source_file: Path, edit_mode: str, metadata_edit: str | None,
              "edited_flag": image_results[1]["residual_flag"],
              "detail": f"Edited 99.9th-percentile residual {image_results[1]['residual_score']:.5f}; threshold {calibration['median_residual_image_threshold']:.5f}."},
         ]
+        unet_outputs = None
+        if UNET_MODEL.is_file():
+            unet_model, unet_config = load_unet_bundle(str(UNET_MODEL))
+            clean_norm_unet, clean_probability, clean_unet_mask = unet_probability_map(
+                clean_ds, unet_model, unet_config
+            )
+            edited_norm_unet, edited_probability, edited_unet_mask = unet_probability_map(
+                edited_ds, unet_model, unet_config
+            )
+            image_threshold = float(unet_config["image_threshold"])
+            clean_score = float(np.max(clean_probability))
+            edited_score = float(np.max(edited_probability))
+            no_reference_rows.append({
+                "name": "Supervised U-Net pixel localizer",
+                "clean_flag": int(clean_score >= image_threshold),
+                "edited_flag": int(edited_score >= image_threshold),
+                "detail": (f"Edited max pixel probability {edited_score:.4f}; image threshold "
+                           f"{image_threshold:.4f}; predicted mask pixels "
+                           f"{int(np.count_nonzero(edited_unet_mask)):,} at "
+                           f"{int(unet_config['image_size'])}x{int(unet_config['image_size'])}."),
+            })
+            unet_outputs = {
+                "clean_image": clean_norm_unet,
+                "edited_image": edited_norm_unet,
+                "clean_probability": clean_probability,
+                "edited_probability": edited_probability,
+                "clean_mask": clean_unet_mask,
+                "edited_mask": edited_unet_mask,
+                "synthetic_mask": synthetic_pixel_mask,
+                "pixel_threshold": float(unet_config["pixel_threshold"]),
+                "image_threshold": image_threshold,
+                "clean_score": clean_score,
+                "edited_score": edited_score,
+            }
         rows = detector_rows(
             clean_detection, edited_detection, pixel_hash_changed,
             int(clean_detection.pixel_integrity_flag or 0), int(edited_detection.pixel_integrity_flag or 0),
@@ -224,6 +347,7 @@ def run_live_demo(source_file: Path, edit_mode: str, metadata_edit: str | None,
             "edited_metadata_hash": metadata_sha256(edited_ds),
             "clean_layout": clean_layout,
             "edited_layout": edited_layout,
+            "unet": unet_outputs,
         }
 
 
@@ -237,6 +361,9 @@ def show_saved_results():
         ("Adaptive feature evasion", PROJECT_ROOT / "experiment_cpaisd_adaptive_evasion" / "adaptive_evasion_summary.csv"),
         ("Benign changes versus attacks", PROJECT_ROOT / "experiment_cpaisd_benign_attack_v3" / "benign_vs_attack_summary.csv"),
         ("Combined metadata + pixel checks", PROJECT_ROOT / "experiment_cpaisd_combined_independent" / "combined_metrics.csv"),
+        ("Supervised U-Net localization metrics", UNET_RESULTS_DIR / "pixel_localization_summary.csv"),
+        ("Supervised U-Net study-level metrics", UNET_RESULTS_DIR / "pixel_localization_study_metrics.csv"),
+        ("Supervised U-Net training history", UNET_RESULTS_DIR / "training_history.csv"),
     ]
     for title, path in results:
         with st.expander(title, expanded=False):
@@ -248,6 +375,20 @@ def show_saved_results():
                     st.warning(f"Could not read this saved result: {exc}")
             else:
                 st.info(f"No saved result file was found at {path.relative_to(PROJECT_ROOT)}")
+    figure_dir = UNET_RESULTS_DIR / "figures"
+    if figure_dir.is_dir():
+        with st.expander("Supervised U-Net localization examples", expanded=False):
+            figure_columns = st.columns(3)
+            figure_specs = [
+                ("localized_patch.png", "Localized patch"),
+                ("sparse_low_amplitude.png", "Sparse low-amplitude edit"),
+                ("copy_move_unseen.png", "Withheld copy-move edit"),
+            ]
+            for column, (filename, caption) in zip(figure_columns, figure_specs):
+                figure_path = figure_dir / filename
+                if figure_path.is_file():
+                    column.image(str(figure_path), caption=caption, use_container_width=True)
+            st.caption("Each figure shows a clean slice, synthetic edit, generated mask, and U-Net prediction at the resized model grid.")
 
 
 st.title("DICOM Security Demo Lab")
@@ -275,7 +416,9 @@ with st.sidebar:
     st.caption("Dataset: data/cpaisd/test")
     st.divider()
     st.metric("Studies in test fold", "10")
-    st.metric("Available checks", "9")
+    st.metric("Available checks", "10" if UNET_MODEL.is_file() else "9")
+    if UNET_MODEL.is_file():
+        st.caption(f"U-Net checkpoint: {UNET_MODEL.parent.relative_to(PROJECT_ROOT)}")
 
 overview_tab, live_tab, results_tab = st.tabs(["Project overview", "Interactive attack lab", "Experiments completed"])
 
@@ -285,7 +428,7 @@ with overview_tab:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Preloaded CT slices", len(dicom_paths))
     c2.metric("Metadata checks", "4")
-    c3.metric("Pixel checks", "4")
+    c3.metric("Pixel checks", "5" if UNET_MODEL.is_file() else "4")
     c4.metric("Saved experiment groups", "8")
     preview_ds = read_dataset(dicom_paths[0], stop_before_pixels=False)
     preview = _normalized_image(preview_ds)
@@ -298,12 +441,14 @@ with overview_tab:
         - **Structural rules:** basic metadata constraints, including CT modality.
         - **Isolation Forest and autoencoder:** metadata anomaly scores learned from clean training data.
         - **No-reference pixel Isolation Forest and median residual:** image-only anomaly baselines that do not compare against a clean image.
+        - **Supervised U-Net pixel localizer:** trained on synthetic edit masks; shown when the trained checkpoint is present. Its output is a research baseline, not a clinical assessment.
         - **Pixel/header consistency:** checks whether image payload layout agrees with DICOM header declarations.
         - **All-checks OR summary:** combines whether any of the above checks alert.
         """)
 
 with live_tab:
     st.subheader("Choose an edit; see the full detector response")
+    st.warning("Research demonstration only: edits are synthetic, and detector alerts do not establish clinical harm or intent.")
     left, right = st.columns([1, 2])
     with left:
         sample_index = st.selectbox(
@@ -322,6 +467,7 @@ with live_tab:
         if mode in {"Pixels only", "Metadata + pixels"}:
             pixel_edit = st.selectbox("Pixel change", [
                 "Localized patch (5x5, +32)", "Sparse low-amplitude (1%, +1)",
+                "Copy-move patch (withheld U-Net family)",
             ])
         st.caption("The selected clean slice supplies a temporary reference. Your preloaded dataset files are never overwritten.")
         run_demo = st.button("Apply change and show everything", type="primary", use_container_width=True)
@@ -340,8 +486,100 @@ with live_tab:
     if result:
         with right:
             st.success(f"Edit applied: {result['edit_description']}")
+            unet_result = result.get("unet")
+            selected_mask = None
+            clean_selected_mask = None
+            selected_threshold = None
+            if unet_result:
+                calibrated_threshold = float(unet_result["pixel_threshold"])
+                log_multiplier = st.slider(
+                    "U-Net mask sensitivity (log10 multiplier; 0 = validation-calibrated)",
+                    min_value=-3.0, max_value=3.0, value=0.0, step=0.1,
+                    help="Adjusts the pixel-probability threshold for this demo only. It does not retrain the model or change the saved experiment metrics.",
+                )
+                selected_threshold = min(1.0, max(1e-12, calibrated_threshold * (10.0 ** log_multiplier)))
+                clean_selected_mask = unet_result["clean_probability"] >= selected_threshold
+                selected_mask = unet_result["edited_probability"] >= selected_threshold
+                clean_pixel_fraction = float(np.mean(clean_selected_mask))
+                edited_alert = bool(np.any(selected_mask))
+                clean_alert = bool(np.any(clean_selected_mask))
+                detector_frame = result["detectors"].copy()
+                unet_row = detector_frame["Check"] == "Supervised U-Net pixel localizer"
+                detector_frame.loc[unet_row, "Clean scan"] = "ALERT" if clean_alert else "Clear"
+                detector_frame.loc[unet_row, "Edited scan"] = "ALERT" if edited_alert else "Clear"
+                detector_frame.loc[unet_row, "New alert"] = "Yes" if edited_alert and not clean_alert else "No"
+                detector_frame.loc[unet_row, "What it checks"] = (
+                    f"Maximum probability {float(np.max(unet_result['edited_probability'])):.4f}; "
+                    f"selected mask threshold {selected_threshold:.6g}; "
+                    f"{int(np.count_nonzero(selected_mask)):,} edited-slice pixels above threshold."
+                )
+                summary_row = detector_frame["Check"] == "All-checks OR summary"
+                component_rows = detector_frame[~detector_frame["Check"].isin(
+                    ["All-checks OR summary"]
+                )]
+                clean_any = bool((component_rows["Clean scan"] == "ALERT").any())
+                edited_any = bool((component_rows["Edited scan"] == "ALERT").any())
+                detector_frame.loc[summary_row, "Clean scan"] = "ALERT" if clean_any else "Clear"
+                detector_frame.loc[summary_row, "Edited scan"] = "ALERT" if edited_any else "Clear"
+                detector_frame.loc[summary_row, "New alert"] = "Yes" if edited_any and not clean_any else "No"
+                detector_frame.loc[summary_row, "What it checks"] = (
+                    "Any configured detector fired; U-Net uses the currently selected pixel threshold."
+                )
+                st.caption(
+                    f"Selected pixel threshold: {selected_threshold:.6g} · "
+                    f"clean reference score {unet_result['clean_score']:.4f} · "
+                    f"edited slice score {unet_result['edited_score']:.4f}. "
+                    "The threshold-based U-Net alert is raised when at least one pixel exceeds the selected threshold."
+                )
+                if result.get("synthetic_mask") is not None and np.any(result["synthetic_mask"]):
+                    from PIL import Image
+                    truth = np.asarray(Image.fromarray(result["synthetic_mask"].astype(np.uint8)).resize(
+                        (selected_mask.shape[1], selected_mask.shape[0]), resample=Image.Resampling.NEAREST
+                    ), dtype=bool)
+                    tp = int(np.count_nonzero(selected_mask & truth))
+                    fp = int(np.count_nonzero(selected_mask & ~truth))
+                    fn = int(np.count_nonzero(~selected_mask & truth))
+                    precision = tp / (tp + fp) if tp + fp else 0.0
+                    recall = tp / (tp + fn) if tp + fn else 0.0
+                    iou = tp / (tp + fp + fn) if tp + fp + fn else 1.0
+                    sensitivity_metrics = st.columns(5)
+                    sensitivity_metrics[0].metric("Clean-slice pixel alarm fraction", f"{clean_pixel_fraction:.2%}")
+                    sensitivity_metrics[1].metric("Edited pixel precision", f"{precision:.2%}")
+                    sensitivity_metrics[2].metric("Edited pixel recall", f"{recall:.2%}")
+                    sensitivity_metrics[3].metric("Edited mask IoU", f"{iou:.3f}")
+                    sensitivity_metrics[4].metric("Thresholded U-Net alert", "ALERT" if edited_alert else "CLEAR")
+                    st.caption("Single edited-slice metrics use the synthetic mask generated for this demo. The clean-slice alarm fraction is not a test-set false-positive rate.")
+                    with st.expander("Compare several thresholds on this demo slice"):
+                        sweep_rows = []
+                        for multiplier in (-2.0, -1.0, 0.0, 1.0, 2.0):
+                            sweep_threshold = min(1.0, max(1e-12, calibrated_threshold * (10.0 ** multiplier)))
+                            sweep_clean = unet_result["clean_probability"] >= sweep_threshold
+                            sweep_edited = unet_result["edited_probability"] >= sweep_threshold
+                            sweep_tp = int(np.count_nonzero(sweep_edited & truth))
+                            sweep_fp = int(np.count_nonzero(sweep_edited & ~truth))
+                            sweep_fn = int(np.count_nonzero(~sweep_edited & truth))
+                            sweep_rows.append({
+                                "log10 multiplier": multiplier,
+                                "pixel threshold": sweep_threshold,
+                                "clean-slice alarm fraction": float(np.mean(sweep_clean)),
+                                "edited precision": sweep_tp / (sweep_tp + sweep_fp) if sweep_tp + sweep_fp else 0.0,
+                                "edited recall": sweep_tp / (sweep_tp + sweep_fn) if sweep_tp + sweep_fn else 0.0,
+                                "edited IoU": sweep_tp / (sweep_tp + sweep_fp + sweep_fn) if sweep_tp + sweep_fp + sweep_fn else 1.0,
+                                "threshold alert": "ALERT" if np.any(sweep_edited) else "CLEAR",
+                            })
+                        sweep_frame = pd.DataFrame(sweep_rows)
+                        st.dataframe(sweep_frame, use_container_width=True, hide_index=True)
+                        st.download_button(
+                            "Download this slice's threshold sweep CSV",
+                            data=sweep_frame.to_csv(index=False),
+                            file_name="unet_demo_threshold_sweep.csv",
+                            mime="text/csv",
+                        )
+                else:
+                    st.metric("Thresholded U-Net alert", "ALERT" if edited_alert else "CLEAR")
+                    st.caption("No synthetic pixel mask is available for this metadata-only edit; the U-Net map still runs on the edited slice.")
             st.subheader("Every check, together")
-            st.dataframe(result["detectors"], use_container_width=True, hide_index=True)
+            st.dataframe(detector_frame if unet_result else result["detectors"], use_container_width=True, hide_index=True)
             metrics = st.columns(4)
             changed_pixels = int(np.count_nonzero(result["difference"]))
             metrics[0].metric("Changed stored pixels", f"{changed_pixels:,}")
@@ -372,7 +610,36 @@ with live_tab:
             overlay = np.repeat(edited_norm[:, :, None], 3, axis=2)
             overlay[edited_mask] = [1.0, 0.15, 0.05]
             st.image(overlay, caption="No-reference patch-Isolation-Forest alert map (red patches)", use_container_width=False)
-            st.caption("The difference map uses the clean reference. The red map is a separate no-reference baseline; it may miss edits and can flag normal image structure. Display scaling is for visualization, not Hounsfield-unit measurement.")
+            if unet_result:
+                unet_columns = st.columns(3)
+                for column, image, mask, title, score in (
+                    (unet_columns[0], unet_result["clean_image"], clean_selected_mask, "U-Net: clean slice", unet_result["clean_score"]),
+                    (unet_columns[1], unet_result["edited_image"], selected_mask, "U-Net: edited mask", unet_result["edited_score"]),
+                ):
+                    unet_overlay = np.repeat(np.asarray(image)[:, :, None], 3, axis=2)
+                    mask_on_display = mask
+                    if mask_on_display.shape != image.shape:
+                        from PIL import Image
+                        mask_on_display = np.asarray(Image.fromarray(mask_on_display.astype(np.uint8)).resize(
+                            (image.shape[1], image.shape[0]), resample=Image.Resampling.NEAREST
+                        ), dtype=bool)
+                    unet_overlay[mask_on_display] = [1.0, 0.15, 0.05]
+                    column.image(unet_overlay, caption=f"{title} · max score {score:.3f}", use_container_width=True)
+                heat_figure, heat_axis = plt.subplots(figsize=(5, 4), constrained_layout=True)
+                heat = heat_axis.imshow(unet_result["edited_probability"], cmap="magma", vmin=0, vmax=1)
+                if np.any(selected_mask) and not np.all(selected_mask):
+                    heat_axis.contour(selected_mask.astype(np.uint8), levels=[0.5],
+                                      colors=["cyan"], linewidths=0.7)
+                heat_axis.set_title("U-Net probability heatmap")
+                heat_axis.axis("off")
+                heat_figure.colorbar(heat, ax=heat_axis, fraction=0.046, pad=0.04,
+                                     label="Predicted edit probability")
+                unet_columns[2].pyplot(heat_figure, clear_figure=True)
+                plt.close(heat_figure)
+                st.caption(f"U-Net calibrated image-score threshold: {unet_result['image_threshold']:.4f}. The slider changes the pixel mask and demo alert threshold only. Masks and heatmap are on the {selected_mask.shape[0]}×{selected_mask.shape[1]} model grid. This supervised model may miss edits and may alert on normal anatomy.")
+            else:
+                st.info("The supervised U-Net checkpoint is not present yet. The other pixel checks are available; train it with the command in README.md to enable U-Net scoring and overlays.")
+            st.caption("The difference map uses the clean reference. The red patch and median-residual maps are no-reference baselines. All may miss edits or flag normal image structure. Display scaling is for visualization, not Hounsfield-unit measurement.")
 
 with results_tab:
     st.subheader("Previously completed research experiments")

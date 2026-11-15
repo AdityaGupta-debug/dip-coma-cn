@@ -202,12 +202,19 @@ uv run streamlit run dashboard/app.py
 ```
 
 The app automatically loads `data/cpaisd/test`, the trained metadata models,
-and the saved no-reference pixel model. No upload or sidebar path setup is
-needed. In **Interactive attack lab**, choose a slice and choose **Metadata
+the saved no-reference pixel model, and the completed 30-epoch U-Net checkpoint
+from `experiment_cpaisd_supervised_localization_512_30ep_complete` when available. No upload or
+sidebar path setup is needed. In **Interactive attack lab**, choose a slice and choose **Metadata
 only**, **Pixels only**, or **Metadata + pixels**. Pick the edit and click
 **Apply change and show everything**. The app displays all implemented checks
-side by side plus clean/edited CT images, a reference-difference heatmap, and
-the no-reference pixel alert map. It edits only temporary copies; the preloaded
+side by side plus clean/edited CT images, a reference-difference heatmap, the
+U-Net probability heatmap, and its thresholded mask overlay. A sensitivity
+slider updates the mask and alert, reports single-slice precision/recall and
+clean-slice alarm fraction, and offers a downloadable five-threshold CSV. Those
+single-slice measures are for demonstration, not test-set estimates. Pixel
+options include a localized patch, sparse edit, and a copy-move patch from the U-Net's
+withheld synthetic attack family. The **Experiments completed** tab
+shows saved metric tables and U-Net localization examples. It edits only temporary copies; the preloaded
 dataset remains unchanged. These are controlled examples, not judgments about
 intent or clinical harm. **Experiments completed** shows saved CSV result
 tables from prior runs.
@@ -219,6 +226,34 @@ are `experiment_cpaisd_cross_layer`, `experiment_cpaisd_adaptive_evasion`,
 `experiment_cpaisd_benign_vs_attack`, and `experiment_cpaisd_study_calibration`.
 The commands below are for reproduction. Each script requires an empty output
 folder, so use a different `--output` name when rerunning.
+
+### Supervised pixel-tamper localization with an unseen attack family
+
+This experiment trains a compact U-Net on synthetic localized-patch and
+sparse-pixel masks from the clean training fold. It calibrates pixel and image
+thresholds on clean validation images, then evaluates on held-out studies. A
+copy-move edit family is deliberately withheld from training to measure transfer
+to one unseen synthetic edit type. The model sees each image alone at test time;
+it does not use a clean-reference image or hash. Results use a resized 256x256
+model grid, not native-resolution clinical masks.
+
+For a longer CPU run, limit training to 512 slices and allow up to 30 epochs.
+At every epoch the runner scores a fixed synthetic-mask validation subset and
+saves the checkpoint with the best macro pixel IoU; the test fold is not used
+to choose the epoch:
+
+```cmd
+uv run python scripts/run_supervised_pixel_localization.py --train data/cpaisd/train --validation data/cpaisd/val --test data/cpaisd/test --output experiment_cpaisd_supervised_localization_512_30ep --max-train-files 512 --epochs 30 --batch-size 8 --image-size 256 --seed 42
+```
+
+For the full official training fold, use `--max-train-files 0` (or omit the
+option) and keep in mind that CPU runtime will rise substantially. The
+test fold remains the full official test set unless `--max-test-files` is set.
+Outputs include the checkpoint, training loss, file/study metrics, pixel Dice
+and IoU by epoch on synthetic validation masks, the selected best epoch, file/study
+test metrics, and example clean/edit/ground-truth/predicted maps. Do not report
+results until the run completes. The withheld copy-move test remains synthetic,
+and the test fold contains only ten studies.
 
 ### Header-to-pixel layout consistency
 

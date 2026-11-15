@@ -23,7 +23,7 @@
 \maketitle
 
 \begin{abstract}
-Digital Imaging and Communications in Medicine (DICOM) objects combine image pixels with metadata used to identify, organize, and interpret imaging studies. This paper reports controlled metadata and pixel-integrity experiments on CPAISD non-contrast brain CT. The metadata experiment used official 92/10/10-study train/validation/test folds (8,376/980/809 instances); its original six-condition macro F1 was 1.000 for per-file metadata SHA-256, 0.170 for structural rules, 0.116 for Isolation Forest, 0.506 for the autoencoder, and 0.635 for the OR hybrid. Hash performance is expected because each clean test file supplied its own reference. In three benign-like controls applied to 809 test files, pixel data and non-target clinical attributes remained unchanged; the hash flagged file-meta and privacy-marker edits but not metadata-preserving reserialization, while anomaly-model alarms did not increase over clean controls. A feature-aware same-length ProtocolName substitution preserved the engineered feature vector in all 177 modified files and evaded each non-hash detector, while SHA-256 detected all edits. A reference-free header-to-pixel layout checker detected 177/177 Rows and Columns mismatches with no findings on clean files or pixel-only controls. Study-level conformal calibration was coarse with ten validation studies: at $\alpha=0.10$, clean-test FPR was 0 for Isolation Forest and 0.10 for the autoencoder. No-reference pixel models had poor localization and the residual comparator's modest image recall came with a high alarm rate. Three study-selection seeds add attack-selection sensitivity analysis but not independent patients. Results remain exploratory and do not establish clinical utility, external generalization, or broad adaptive-attack resistance.
+Digital Imaging and Communications in Medicine (DICOM) objects combine image pixels with metadata used to identify, organize, and interpret imaging studies. This paper reports controlled metadata and pixel-integrity experiments on CPAISD non-contrast brain CT. The metadata experiment used official 92/10/10-study train/validation/test folds (8,376/980/809 instances); its original six-condition macro F1 was 1.000 for per-file metadata SHA-256, 0.170 for structural rules, 0.116 for Isolation Forest, 0.506 for the autoencoder, and 0.635 for the OR hybrid. Hash performance is expected because each clean test file supplied its own reference. In three benign-like controls applied to 809 test files, pixel data and non-target clinical attributes remained unchanged; the hash flagged file-meta and privacy-marker edits but not metadata-preserving reserialization, while anomaly-model alarms did not increase over clean controls. A feature-aware same-length ProtocolName substitution preserved the engineered feature vector in all 177 modified files and evaded each non-hash detector, while SHA-256 detected all edits. A reference-free header-to-pixel layout checker detected 177/177 Rows and Columns mismatches with no findings on clean files or pixel-only controls. Study-level conformal calibration was coarse with ten validation studies: at $\alpha=0.10$, clean-test FPR was 0 for Isolation Forest and 0.10 for the autoencoder. A supervised U-Net trained on 512 images for 30 CPU epochs, with epoch selection by synthetic validation-mask IoU, achieved test image F1 of 0.963, 0.944, and 0.885 for localized-patch, sparse, and withheld copy-move edits, respectively. Pixel IoU was 0.376, 0.335, and 0.386; clean-test image FPR was 2.84\%. Study-level false-positive rates remained high (0.50--0.625) across ten test studies, and pixel localization precision was 0.339--0.424. The findings are exploratory and do not establish clinical utility, external generalization, or broad adaptive-attack resistance.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -83,7 +83,7 @@ The reviewed literature establishes that DICOM integrity, watermarking, and fore
 
 \section{Proposed Methodology}
 \subsection{System overview}
-The workflow preserves the metadata and pixel investigations as distinct tracks. The metadata track extracts header features, fits unsupervised models using training data, calibrates thresholds on validation data, and evaluates controlled metadata edits. The pixel track includes reference-free anomaly baselines, header-to-pixel layout checks, and a separate reference-based integrity experiment that computes edit-mask and difference summaries. Study-level conformal calibration, benign-change controls, a feature-aware evasion condition, and per-alert explanations extend the evaluation.
+The workflow preserves the metadata and pixel investigations as distinct tracks. The metadata track extracts header features, fits unsupervised models using training data, calibrates thresholds on validation data, and evaluates controlled metadata edits. The pixel track includes reference-free anomaly baselines, header-to-pixel layout checks, a separate reference-based integrity experiment, and a supervised U-Net segmenter trained on synthetic masks. Study-level conformal calibration, benign-change controls, a feature-aware evasion condition, and per-alert explanations extend the evaluation.
 
 \begin{figure*}[t]
 \centering
@@ -169,6 +169,53 @@ The implementation records the changed-pixel count and fraction, mean absolute d
 The no-reference detector operates on each image independently and never reads a clean counterpart or a pixel hash during prediction. Each image is robustly scaled using its 1st and 99th intensity percentiles, partitioned into non-overlapping $16\times16$ patches, and represented by six local intensity/texture features: mean, standard deviation, horizontal and vertical mean absolute gradients, high-deviation fraction, and log-scaled standard deviation. An Isolation Forest with 100 trees is fit to 50,000 randomly sampled clean patches from 2,084 training slices. Two thresholds are calibrated on clean validation data: the 1st percentile of validation patch scores for pixel-map blocks, and the 1st percentile of per-image minimum patch scores for image alarms. The saved synthetic masks are used only for evaluation. Predicted localization is blockwise at $16\times16$ resolution, so localization metrics reflect this coarse grid and the specified synthetic attacks.
 
 A second no-reference comparator computes a $5\times5$ median-filter residual $R_i=|I_i-\operatorname{MedianFilter}_{5\times5}(I_i)|$ on each independently normalized image. Its pixel threshold is the 99.9th percentile of clean validation residual samples. Its image alarm score is the 99.9th percentile residual within an image, thresholded at the 99th percentile of these image scores on clean validation data. This comparator is a simple high-frequency baseline; neither its prediction nor calibration uses a clean test counterpart.
+
+\subsection{Supervised U-Net localization model}
+The supervised pixel baseline is a compact 2-D U-Net with four encoder stages, a bottleneck, four decoder stages, and skip concatenations following the standard U-Net design \cite{ronneberger2015}. Each stage uses two $3\times3$ convolutions with batch normalization and ReLU; encoder stages are separated by $2\times2$ max pooling, and decoder stages use $2\times2$ transposed convolutions. With base width $b=8$, the feature widths are $8,16,32,64,128$ from input to bottleneck, then $64,32,16,8$ through the decoder. A $1\times1$ convolution produces one per-pixel logit map. Each input is robustly normalized using its 1st and 99th intensity percentiles and resized to $256\times256$; inference uses the image alone, without a clean counterpart or hash.
+
+Training uses synthetic localized patches and sparse low-amplitude perturbations, with the exact changed pixels serving as binary supervision masks. The network is trained with a weighted binary-cross-entropy and soft-Dice objective, each weighted by $0.5$, using AdamW (learning rate $10^{-3}$, weight decay $10^{-4}$). The positive BCE weight is 12 to account for the small edited area. Clean validation predictions set the pixel threshold to the 99.5th percentile of sampled pixel probabilities and the image threshold to the 99th percentile of per-image maximum probabilities. A copy-move family is withheld from training and used as a synthetic out-of-family test. The model grid and masks are resized representations; no native-resolution clinical annotation is used.
+
+The initial four-epoch pilot reported below used its final epoch. The revised runner additionally generates fixed localized-patch and sparse-edit masks on a 256-image validation subset (128 images per family), computes family-wise pixel Dice and IoU after each epoch at probability threshold 0.5, and selects the checkpoint with the best macro validation IoU. In the 30-epoch run, epoch 30 was selected; the final test evaluation completed using this checkpoint.
+
+\begin{figure*}[t]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  block/.style={draw,rounded corners,align=center,minimum width=1.30cm,minimum height=0.78cm,inner sep=3pt,font=\scriptsize},
+  arrow/.style={-{Latex[length=1.7mm]},thick},
+  skip/.style={-{Latex[length=1.7mm]},thick,dashed,blue!70!black}
+]
+\node[block] (input) at (0,0) {Input\\$256^2\times1$};
+\node[block] (enc1) at (1.65,0) {Encoder 1\\$256^2\times8$};
+\node[block] (enc2) at (3.30,-1) {Encoder 2\\$128^2\times16$};
+\node[block] (enc3) at (4.95,-2) {Encoder 3\\$64^2\times32$};
+\node[block] (enc4) at (6.60,-3) {Encoder 4\\$32^2\times64$};
+\node[block] (bottleneck) at (8.25,-4) {Bottleneck\\$16^2\times128$};
+\node[block] (dec4) at (9.90,-3) {Decoder 4\\$32^2\times64$};
+\node[block] (dec3) at (11.55,-2) {Decoder 3\\$64^2\times32$};
+\node[block] (dec2) at (13.20,-1) {Decoder 2\\$128^2\times16$};
+\node[block] (dec1) at (14.85,0) {Decoder 1\\$256^2\times8$};
+\node[block] (output) at (16.50,0) {Mask logits\\$256^2\times1$};
+\draw[arrow] (input) -- (enc1);
+\draw[arrow] (enc1) -- node[above,font=\tiny]{pool} (enc2);
+\draw[arrow] (enc2) -- node[above,font=\tiny]{pool} (enc3);
+\draw[arrow] (enc3) -- node[above,font=\tiny]{pool} (enc4);
+\draw[arrow] (enc4) -- node[above,font=\tiny]{pool} (bottleneck);
+\draw[arrow] (bottleneck) -- node[above,font=\tiny]{up + concat} (dec4);
+\draw[arrow] (dec4) -- node[above,font=\tiny]{up + concat} (dec3);
+\draw[arrow] (dec3) -- node[above,font=\tiny]{up + concat} (dec2);
+\draw[arrow] (dec2) -- node[above,font=\tiny]{up + concat} (dec1);
+\draw[arrow] (dec1) -- (output);
+\draw[skip] (enc4.north) -- (dec4.north);
+\draw[skip] (enc3.north) -- (dec3.north);
+\draw[skip] (enc2.north) -- (dec2.north);
+\draw[skip] (enc1.north) -- (dec1.north);
+\node[font=\tiny,blue!70!black,anchor=west] at (0.0,0.72) {Dashed arrows: encoder-to-decoder skip connections};
+\end{tikzpicture}%
+}
+\caption{Implemented compact U-Net used for synthetic pixel-tamper localization. Convolutional blocks contain two $3\times3$ convolution, batch-normalization, and ReLU layers. Decoder stages upsample and concatenate the corresponding encoder features; the output is a per-pixel logit map.}
+\label{fig:unet_architecture}
+\end{figure*}
 
 \subsection{Study-level conformal calibration}
 To calibrate alerts at the unit of use, slice scores are aggregated per baseline-keyed study using maximum anomaly severity: $-s_{\mathrm{IF}}$ for Isolation Forest and reconstruction error for the autoencoder. For a test-study score $q$, the conformal tail probability is
@@ -416,6 +463,82 @@ Slice inconsistency & 2 & 1.00/0.00 & 0.00/0.00 & 0.00009537 & 0.000763 & 8 \\
 \subsection{No-reference pixel anomaly results}
 The clean-trained patch Isolation Forest used 50,000 patches sampled from 2,084 training files, with thresholds calibrated from 980 validation files. On 809 clean test files, the observed image-level false-positive rate was 0.0111 and the pixel-map false-positive fraction was 0.0191. The detector did not identify any attacked image at its calibrated image threshold across the three synthetic attack conditions. Its pixel-level localization was weak: for low-amplitude edits, precision was 0.0100, recall 0.0052, and IoU 0.0034; localized-patch and slice-inconsistency localization had zero recall. The second, $5\times5$ median-filter residual comparator had an 8.78\% clean-test image alarm rate and a 0.0125\% pixel-map alarm fraction. In attacked conditions, it detected 6.21\% of localized-patch images and 5.65\% of low-amplitude images, but also flagged 9.65\% of unmodified files in those conditions; it detected no slice-inconsistency images. Pixel-mask IoU was zero for localized and slice edits and 0.00012 for the low-amplitude edits. Thus neither no-reference baseline provided useful localization, and the residual comparator's modest image recall came with a high false-alarm rate. These findings show that the simple image-only baselines did not reliably detect the tested edits at their validation-calibrated operating points. The results are negative but informative: a no-reference detector is a harder problem than exact-reference hashing, and synthetic changed-pixel masks do not guarantee separability from normal CT texture.
 
+\subsection{Initial four-epoch U-Net pilot (superseded)}
+An initial compact U-Net pilot, following the encoder--decoder design used for biomedical segmentation \cite{ronneberger2015}, used 512 training-fold images and four CPU epochs (batch size 8, input resized to $256\times256$, base width 8). The training generator alternated between localized-patch and sparse low-amplitude edits and supplied their synthetic binary masks. The copy-move family was withheld from training. Pixel and image thresholds were calibrated from clean validation predictions at the 99.5th percentile of sampled pixel probabilities and the 99th percentile of image-maximum probabilities, respectively. This initial run used the final epoch and is retained below only as a baseline; the completed validation-selected 30-epoch evaluation follows. Table~\ref{tab:unet} reports image-level classification metrics across all 809 test images per condition and pixel-level pooled metrics over modified images only.
+
+The image AUROC was highest for sparse low-amplitude attacks (0.778), yet the thresholded image recall remained at or below 0.114 for every condition. Pixel IoU was 0.071 for localized patches, 0.222 for sparse perturbations, and 0.036 for the unseen copy-move condition. Clean-test image FPR was 0.0618 and the clean pixel alarm fraction was 0.0114. At study level, F1/FPR were 0.250/0.625 for localized patches and 0.500/0.500 for each of sparse and copy-move conditions. Therefore, this pilot provides a supervised no-reference localization comparison, but its thresholded detections and study-level false alarms are poor. The better ranking AUROC for sparse edits should not be mistaken for useful performance at the selected operating threshold.
+
+\begin{table*}[t]
+\caption{Four-epoch pilot U-Net performance. Image metrics use all 809 test instances per condition; pixel metrics pool pixels from edited instances only. The copy-move family was withheld from training.}
+\label{tab:unet}
+\centering\scriptsize
+\begin{tabular}{lrrrrrrr}
+\toprule
+Test edit & Image AUROC & Image AUPRC & Image recall & Image FPR & Image F1 & Pixel F1 & Pixel IoU \\
+\midrule
+Localized patch & 0.700 & 0.432 & 0.114 & 0.040 & 0.189 & 0.133 & 0.071 \\
+Sparse low-amplitude & 0.778 & 0.328 & 0.086 & 0.056 & 0.129 & 0.364 & 0.222 \\
+Copy-move (withheld family) & 0.718 & 0.256 & 0.065 & 0.061 & 0.095 & 0.070 & 0.036 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The initial pilot predicted masks and synthetic ground-truth masks were generated at the resized model grid. Figure~\ref{fig:unet} illustrates representative outputs from the completed 30-epoch model. In this initial pilot, sparse-edit pixel precision was 0.227 and study-level FPR was 0.500. These pilot metrics were superseded by the completed run below; both runs test only scripted attacks and do not establish generalization to naturally occurring tampering.
+
+\begin{figure*}[t]
+\centering
+\begin{minipage}[t]{0.32\textwidth}\centering
+\includegraphics[width=\linewidth]{unet_localized_patch.png}\\[-2pt]
+\scriptsize (a) Localized patch
+\end{minipage}\hfill
+\begin{minipage}[t]{0.32\textwidth}\centering
+\includegraphics[width=\linewidth]{unet_sparse_low_amplitude.png}\\[-2pt]
+\scriptsize (b) Sparse low-amplitude edit
+\end{minipage}\hfill
+\begin{minipage}[t]{0.32\textwidth}\centering
+\includegraphics[width=\linewidth]{unet_copy_move_unseen.png}\\[-2pt]
+\scriptsize (c) Withheld copy-move edit
+\end{minipage}
+\caption{Representative inputs, synthetic ground-truth masks, and predictions from the completed 30-epoch U-Net. Outputs are displayed on the $256\times256$ model grid; these visual examples do not replace the quantitative test metrics.}
+\label{fig:unet}
+\end{figure*}
+
+\subsubsection{Completed validation-selected 30-epoch evaluation}
+The completed run used the same capped subset of 512 training images and finished all 30 epochs on CPU (about 49 minutes). Epoch 30 was selected by macro pixel IoU on the fixed synthetic-mask validation subset, with training loss 0.0603 and validation macro Dice/IoU of 0.9608/0.9254. Table~\ref{tab:unetval} reports family-wise validation metrics for 128 images per edit family. Because these measurements were used for checkpoint selection, they are not independent estimates. The selected model was then evaluated on all 809 held-out test images under three synthetic edit conditions, with each condition attacking two of the ten studies. Table~\ref{tab:unet30} reports the test results.
+
+\begin{table}[t]
+\caption{Synthetic-mask validation metrics for the selected epoch in the 30-epoch U-Net run. These are model-selection diagnostics, not independent test estimates.}
+\label{tab:unetval}
+\centering\scriptsize
+\begin{tabular}{lrrrr}
+\toprule
+Validation edit & $n$ & Pixel precision & Pixel recall & Dice / IoU \\
+\midrule
+Localized patch & 128 & 0.986 & 0.980 & 0.983 / 0.967 \\
+Sparse low-amplitude & 128 & 0.991 & 0.891 & 0.938 / 0.884 \\
+Macro mean & 256 & -- & -- & 0.961 / 0.925 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table*}[t]
+\caption{Held-out test results for the validation-selected 30-epoch U-Net. Image metrics use all 809 test instances per condition; pixel metrics pool changed pixels over the attacked images. Copy-move was withheld from training.}
+\label{tab:unet30}
+\centering\scriptsize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+Edit family & $n_+$ & Image AUROC & Image AUPRC & Image recall & Image FPR & Image F1 & Pixel precision & Pixel recall & Pixel IoU \\
+\midrule
+Localized patch & 236 & 0.984 & 0.931 & 0.996 & 0.030 & 0.963 & 0.376 & 0.999 & 0.376 \\
+Sparse low-amplitude & 152 & 0.986 & 0.894 & 1.000 & 0.027 & 0.944 & 0.339 & 0.964 & 0.335 \\
+Copy-move (withheld) & 139 & 0.972 & 0.862 & 0.885 & 0.024 & 0.885 & 0.424 & 0.812 & 0.386 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+On the untouched test fold, the observed image-level FPR was 0.0284 and the pixel alarm fraction was 0.0128. Although the file-level image F1 scores are high under these scripted conditions, pixel precision was 0.339--0.424, so many highlighted pixels were outside the synthetic masks. Study-level recall was 1.000 for all three conditions, but study-level FPR was 0.625 for localized patches and 0.500 for sparse and copy-move conditions. These point estimates come from only ten studies and two positive studies per condition; they do not establish reliable study-level detection or generalization. The pixel threshold selected from clean validation scores was 0.000858, and the image-score threshold was 1.000; this operating point and its calibration should be examined in follow-up work.
+
 \begin{table}[t]
 \caption{No-reference pixel detector performance. File FPR uses all 809 attacked-condition files; localization metrics aggregate only modified instances against their synthetic masks.}
 \label{tab:noref}
@@ -535,7 +658,7 @@ Several limitations constrain interpretation:
   \item \textbf{Series/file label mismatch.} The UID attack changes one instance per selected series, but labels only the edited files as positive while the contextual rule flags neighboring slices. File-level false positives therefore include valid series-level detections. The corrected evaluation now reports metrics at the immutable baseline series unit, but the test contains only ten series, limiting precision of those estimates.
   \item \textbf{Feature limitations.} Several text fields are reduced to presence and length, and unknown categorical values can be discarded by the fitted vectorizer. The autoencoder may recognize the specific engineered length/value shifts without detecting semantically wrong but statistically ordinary substitutions.
   \item \textbf{Incomplete software provenance.} The run configuration records the seed and model parameters but not all package versions, hardware specifications, or deterministic-runtime settings. The reported elapsed time is not independently reproducible from the paper alone.
-  \item \textbf{Limited pixel evaluation.} The pixel experiment uses three deterministic synthetic edits and a per-file clean reference. The reference-difference/mask IoU is a bookkeeping check. A no-reference patch Isolation Forest had zero image-level recall on all three attack types at its calibrated threshold. The median-filter residual comparator detected only a small fraction of two attack conditions, with a clean-test image alarm rate of 8.78\% and near-zero localization. Both are simple baselines, not mature image-tamper detectors. Edits operate on stored integer values without applying the DICOM rescale transform, so they are not calibrated in HU. The pixel editor supports uncompressed single-frame 2-D integer images.
+  \item \textbf{Limited pixel evaluation.} The reference-difference/mask IoU is a bookkeeping check, and the no-reference patch Isolation Forest and median-filter residual baselines had poor detection or localization. The completed 30-epoch supervised U-Net was trained on a capped set of 512 images and achieved image F1 0.885--0.963 and pixel IoU 0.335--0.386 on three synthetic test conditions. However, pixel precision was only 0.339--0.424, and study-level FPR was 0.500--0.625 across only ten studies. Its validation masks and test attacks are synthetic, localization is measured on a resized $256\times256$ grid rather than native resolution, and edits are not calibrated in HU. The pixel editor supports uncompressed single-frame 2-D integer images.
   \item \textbf{Seed sensitivity scope.} The three-seed repeatability analysis changes which studies receive each synthetic attack but reuses the same ten-study test fold and fitted models. Its study-cluster bootstrap intervals do not account for site or population variation and may be degenerate when predictions are identical across seeds.
   \item \textbf{Coarse study calibration.} Conformal score calibration has only ten clean validation studies, so its minimum attainable $p$-value is $1/11$. The resulting operating points are coarse and do not guarantee a population-level false-alarm rate.
   \item \textbf{Simple cross-layer attacks.} Rows/Columns mismatch attacks create an obvious conflict between declared dimensions and payload length. The checker is not evaluated against plausible but incorrect metadata that still matches encoded layout, nor against every compressed or multiframe transfer syntax.
@@ -546,14 +669,15 @@ Several limitations constrain interpretation:
 \end{enumerate}
 
 \section{Conclusion and Future Work}
-This paper reports exploratory metadata, reference-based pixel-integrity, no-reference pixel anomaly, cross-layer consistency, study calibration, benign-change control, adaptive-evasion, severity-sweep, and combined-edit experiments on official CPAISD folds. In the original metadata experiment, macro F1 was 1.000 for metadata SHA-256, 0.170 for structural rules, 0.116 for Isolation Forest, and 0.506 for the autoencoder; the OR hybrid achieved 0.635 macro F1 with 0.207 macro FPR. A feature-aware same-length ProtocolName edit preserved the model input in all 177 modified files and evaded each non-hash detector, while the reference hash detected all changes. Cross-layer layout rules detected all 177 Rows and Columns mismatches and had no findings on clean or pixel-only control files. At study-level conformal $\alpha=0.10$, the clean-test FPR was 0 for Isolation Forest and 0.10 for the autoencoder, with only ten validation studies available for calibration. The no-reference patch Isolation Forest did not detect the scripted pixel attacks at its calibrated image threshold; a median-residual comparator detected only 5.6--6.2\% of two image-level conditions with 9.65\% condition-level FPR and negligible localization. Pixel SHA-256 detected all edits across tested severities against the exact clean reference. Three benign-like controls preserved PixelData and non-target clinical attributes in all 809 files: the strict metadata hash alarmed on all file-meta and privacy-marker edits but not on metadata-preserving reserialization. The autoencoder's 112 clean-test alarms persisted unchanged across all three conditions. These findings remain descriptive for one ten-study test fold and do not show generalization to another dataset, robust adaptive resistance, or clinical utility.
+This paper reports exploratory metadata, reference-based pixel-integrity, no-reference pixel anomaly, cross-layer consistency, study calibration, benign-change control, adaptive-evasion, severity-sweep, combined-edit, and supervised-localization experiments on official CPAISD folds. In the original metadata experiment, macro F1 was 1.000 for metadata SHA-256, 0.170 for structural rules, 0.116 for Isolation Forest, and 0.506 for the autoencoder; the OR hybrid achieved 0.635 macro F1 with 0.207 macro FPR. A feature-aware same-length ProtocolName edit preserved the model input in all 177 modified files and evaded each non-hash detector, while the reference hash detected all changes. Cross-layer layout rules detected all 177 Rows and Columns mismatches and had no findings on clean or pixel-only control files. At study-level conformal $\alpha=0.10$, the clean-test FPR was 0 for Isolation Forest and 0.10 for the autoencoder, with only ten validation studies available for calibration. The no-reference patch Isolation Forest did not detect the scripted pixel attacks at its calibrated image threshold; a median-residual comparator detected 5.6--6.2\% of two image-level conditions with 9.65\% condition-level FPR and negligible localization. The completed 30-epoch U-Net, trained on 512 images with a validation-selected checkpoint, achieved image F1 0.885--0.963 and pixel IoU 0.335--0.386 across three synthetic test conditions. Its clean-test image FPR was 2.84\%, but pixel precision remained 0.339--0.424 and study-level FPR was 0.500--0.625 across ten studies. Thus the longer run improved pixel overlap over the four-epoch pilot, but false highlighted pixels and study-level alarms remain substantial. Pixel SHA-256 detected all edits across tested severities against the exact clean reference. Three benign-like controls preserved PixelData and non-target clinical attributes in all 809 files: the strict metadata hash alarmed on all file-meta and privacy-marker edits but not on metadata-preserving reserialization. The autoencoder's 112 clean-test alarms persisted unchanged across all three conditions. These findings remain descriptive for one ten-study test fold and do not show generalization to another dataset, robust adaptive resistance, or clinical utility.
 
-Before publication or stronger claims, the no-reference pixel model needs improved features and evaluation on more realistic pixel changes. The header-to-pixel rules should be tested on plausible metadata edits that retain a decodable payload. Adaptive evaluation should cover more fields and attackers with access to detector outputs. Study-level calibration requires many more independent validation studies. Benign control should be extended to documented PACS exports. A second DICOM cohort is required for cross-dataset evaluation; CQ500 is a candidate external head-CT cohort, but its hemorrhage population differs from CPAISD's ischemic-stroke focus and access is subject to its non-commercial license and end-user agreement \cite{linyuh2024}. The project includes an external-evaluation script, but no external data were available in this run, so no cross-dataset result is claimed. Multi-site data and study-level uncertainty estimates remain necessary.
+Before publication or stronger claims, the U-Net needs more independent training studies, calibration targeted at lower study-level false-alarm rates, and evaluation with multiple attack generators and native-resolution masks. The completed 30-epoch run provides held-out results, but only on one ten-study cohort with synthetic attacks; its high study-level false-alarm rates limit practical interpretation. The no-reference pixel models also need improved features and more realistic pixel changes. The header-to-pixel rules should be tested on plausible metadata edits that retain a decodable payload. Adaptive evaluation should cover more fields and attackers with access to detector outputs. Study-level calibration requires many more independent validation studies. Benign control should be extended to documented PACS exports. A second DICOM cohort is required for cross-dataset evaluation; CQ500 is a candidate external head-CT cohort, but its hemorrhage population differs from CPAISD's ischemic-stroke focus and access is subject to its non-commercial license and end-user agreement \cite{linyuh2024}. The project includes an external-evaluation script, but no external data were available in this run, so no cross-dataset result is claimed. Multi-site data and study-level uncertainty estimates remain necessary.
 
 \section*{Reproducibility and Data Availability}
-The original metadata experiment used seed 42, all official CPAISD folds, a 20\% study-level attack fraction, 40 autoencoder epochs, and no cap on training or validation instances. Extensions include same-length substitutions, the ProtocolName feature-collision test, rows/columns layout inconsistencies, study-level conformal calibration, per-alert explanation fields, three benign-like transformations, and four metadata attacks under selection seeds 42, 43, and 44 with 2,000 stratified study/series bootstrap resamples. The benign-change comparison used the 809 clean test instances, a freshly generated metadata baseline, and the existing six scripted attack folders; audits confirmed unchanged PixelData and non-target clinical attributes in all benign-like conditions. The no-reference pixel baselines were calibrated using 980 validation files; the patch Isolation Forest used 50,000 patches from 2,084 clean training files. The corrected combined run used seed 42 for metadata selection and seed 44 for pixel selection; it records 177 metadata edits, 133 pixel edits, and 310 unique union positives per condition. Outputs include per-file/series/study predictions, feature-level explanations, calibration reports, pixel metrics, packed edit masks, anomaly heatmaps, severity tables, and combined-condition metrics. The external-evaluation script is provided but was not run because no external cohort was present. No vendor PACS export was available; the benign-like transformations are synthetic and are not validated workflow exports. Hardware details were not captured, so recorded elapsed time is not a portable benchmark. The project implementation and scripts are present in the authors' workspace; a public, versioned code archive has not yet been deposited. CPAISD is available from Zenodo under its dataset record; users must follow the current dataset license and citation requirements \cite{umerenkov2025,cpaisdzenodo}. No patient-level data are reproduced in this manuscript.
+The revised U-Net runner records per-epoch validation-mask Dice/IoU and selects the checkpoint by validation macro IoU. The completed 30-epoch CPU run used seed 42, 512 capped training images, 980 validation images, and 809 test images across ten studies; epoch 30 was selected (validation macro Dice 0.9608, IoU 0.9254 on 256 synthetic validation images). It completed held-out testing and saved its checkpoint, predictions, metrics, history, and figures under \texttt{experiment\_cpaisd\_supervised\_localization\_512\_30ep\_complete}. The run took 2,946 seconds (about 49 minutes).
+The supervised-localization pilot used seed 42, 512 training images (cap), all 980 validation images, all 809 test images across ten studies, four epochs, batch size 8, $256\times256$ input, and CPU execution (reported elapsed time 645.75 s). Training masks were generated for localized-patch and sparse low-amplitude edits; copy-move was withheld from training. Thresholds were calibrated from clean validation predictions. Per-image predictions, summary and study-level metric CSVs, training history, checkpoint, and example figures for the original four-epoch pilot are saved under \texttt{experiment\_cpaisd\_supervised\_localization}. This capped pilot is retained as a historical baseline and must not be confused with the completed 30-epoch evaluation. The original metadata experiment used seed 42, all official CPAISD folds, a 20\% study-level attack fraction, 40 autoencoder epochs, and no cap on training or validation instances. Other extensions include same-length substitutions, the ProtocolName feature-collision test, rows/columns layout inconsistencies, study-level conformal calibration, per-alert explanation fields, three benign-like transformations, and four metadata attacks under selection seeds 42, 43, and 44 with 2,000 stratified study/series bootstrap resamples. The benign-change comparison used the 809 clean test instances, a freshly generated metadata baseline, and the existing six scripted attack folders; audits confirmed unchanged PixelData and non-target clinical attributes in all benign-like conditions. The no-reference pixel baselines were calibrated using 980 validation files; the patch Isolation Forest used 50,000 patches from 2,084 clean training files. The corrected combined run used seed 42 for metadata selection and seed 44 for pixel selection; it records 177 metadata edits, 133 pixel edits, and 310 unique union positives per condition. Outputs include per-file/series/study predictions, feature-level explanations, calibration reports, pixel metrics, packed edit masks, anomaly heatmaps, severity tables, and combined-condition metrics. The external-evaluation script is provided but was not run because no external cohort was present. No vendor PACS export was available; the benign-like transformations are synthetic and are not validated workflow exports. Hardware details were not captured for the earlier runs, so their recorded elapsed time is not a portable benchmark. The project implementation and scripts are present in the authors' workspace; a public, versioned code archive has not yet been deposited. CPAISD is available from Zenodo under its dataset record; users must follow the current dataset license and citation requirements \cite{umerenkov2025,cpaisdzenodo}. No patient-level data are reproduced in this manuscript.
 
-\begin{thebibliography}{8}
+\begin{thebibliography}{9}
 \bibitem{dicomps315}
 DICOM Standards Committee, ``DICOM PS3.15: Security and System Management Profiles,'' 2026 edition. [Online]. Available: \url{https://dicom.nema.org/medical/dicom/current/output/chtml/part15/ps3.15.html}. Accessed: Nov. 12, 2026.
 
@@ -574,6 +698,9 @@ S. Oh, E. Lee, S. Lee, J. Park, S. Park, and G. Kim, ``Forensic detection of med
 
 \bibitem{linyuh2024}
 E. Lin and E. L. Yuh, ``Semi-supervised learning for generalizable intracranial hemorrhage detection and segmentation,'' \emph{Radiology: Artificial Intelligence}, vol. 6, no. 3, Art. no. e230077, 2024, doi: 10.1148/ryai.230077. The authors describe CQ500 as an external DICOM head-CT cohort and report its CC BY-NC-SA 4.0 license and end-user agreement.
+
+\bibitem{ronneberger2015}
+O. Ronneberger, P. Fischer, and T. Brox, ``U-Net: Convolutional networks for biomedical image segmentation,'' in \emph{Medical Image Computing and Computer-Assisted Intervention---MICCAI 2015}, LNCS, vol. 9351, pp. 234--241, 2015, doi: 10.1007/978-3-319-24574-4\_28.
 
 \bibitem{umerenkov2025}
 D. Umerenkov, S. Kudin, M. Peksheva, and D. Pavlov, ``Core-penumbra hyperacute ischemic stroke dataset,'' \emph{Scientific Data}, vol. 12, no. 1, Art. no. 707, 2025, doi: 10.1038/s41597-025-05000-0.
