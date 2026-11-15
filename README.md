@@ -8,6 +8,7 @@ This version is designed for a small real brain-CT cohort and metadata-only proc
 
 Use **CPAISD: Core-Penumbra Acute Ischemic Stroke Dataset**.
 
+
 - 112 non-contrast cranial CT studies.
 - 92 training studies (8,376 slices), 10 validation studies (980 slices), 10 test studies (809 slices).
 - DICOM slices (`raw.dcm`) plus image/mask arrays and metadata.
