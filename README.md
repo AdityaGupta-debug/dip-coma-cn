@@ -1,418 +1,578 @@
-# Brain CT DICOM Metadata and Pixel Integrity Security Research
+# DICOM Brain CT Integrity: Metadata + Pixel Tampering Detection (In-Depth Explainer)
 
-**Research title:** Detecting DICOM Metadata Tampering in Non-Contrast Brain CT: A Comparative Evaluation of Integrity, Rules, and Anomaly Detection
+> Paper: *Reference-Based Integrity Checking and Metadata Anomaly Detection for DICOM Brain CT: A Controlled Study of Metadata and Pixel Tampering*
+> Authors: Aditya Upendra Gupta, Aaditya Awasthi, Nidal, Sudhawalli
+> Dataset: CPAISD (non-contrast brain CT, hyperacute ischemic stroke)
 
-This version is designed for a small real brain-CT cohort and metadata-only processing. It does not require CQ500's 28.66 GB download.
+**Status:** exploratory. One dataset, a 10-study test fold, synthetic attacks, mostly single-seed runs. Not a clinical study.
 
-## Dataset: CPAISD
+---
 
-Use **CPAISD: Core-Penumbra Acute Ischemic Stroke Dataset**.
+## Table of contents
 
+- [DICOM Brain CT Integrity: Metadata + Pixel Tampering Detection (In-Depth Explainer)](#dicom-brain-ct-integrity-metadata--pixel-tampering-detection-in-depth-explainer)
+  - [Table of contents](#table-of-contents)
+  - [1. The problem](#1-the-problem)
+  - [2. Core idea in one paragraph](#2-core-idea-in-one-paragraph)
+  - [3. Threat model](#3-threat-model)
+  - [4. Dataset and splits](#4-dataset-and-splits)
+  - [5. Pipeline overview](#5-pipeline-overview)
+  - [6. Metadata track: detectors](#6-metadata-track-detectors)
+    - [6.1 Canonical metadata SHA-256 (reference-based)](#61-canonical-metadata-sha-256-reference-based)
+    - [6.2 Structural rules (reference-free)](#62-structural-rules-reference-free)
+    - [6.3 Study/series consistency checker (reference-free)](#63-studyseries-consistency-checker-reference-free)
+    - [6.4 Isolation Forest](#64-isolation-forest)
+    - [6.5 Autoencoder](#65-autoencoder)
+    - [6.6 Feature representation (important for the results)](#66-feature-representation-important-for-the-results)
+    - [6.7 OR hybrid](#67-or-hybrid)
+  - [7. Metadata track: attacks](#7-metadata-track-attacks)
+  - [8. Metadata track: results explained](#8-metadata-track-results-explained)
+    - [8.1 Macro-average (six original attacks, instance level)](#81-macro-average-six-original-attacks-instance-level)
+    - [8.2 Per-attack detail (recall / FPR)](#82-per-attack-detail-recall--fpr)
+    - [8.3 UID inconsistency: label granularity issue](#83-uid-inconsistency-label-granularity-issue)
+    - [8.4 Same-length substitutions](#84-same-length-substitutions)
+    - [8.5 Study/series consistency checker](#85-studyseries-consistency-checker)
+    - [8.6 The coordinated edit (the checker's limit)](#86-the-coordinated-edit-the-checkers-limit)
+    - [8.7 Feature-aware adaptive evasion](#87-feature-aware-adaptive-evasion)
+    - [8.8 Optimizer comparison (AE, 40 epochs, seed 42)](#88-optimizer-comparison-ae-40-epochs-seed-42)
+    - [8.9 Header-to-pixel layout checker](#89-header-to-pixel-layout-checker)
+  - [9. Pixel track: detectors](#9-pixel-track-detectors)
+  - [10. Pixel track: attacks](#10-pixel-track-attacks)
+  - [11. Pixel track: results explained](#11-pixel-track-results-explained)
+    - [11.1 Hashes](#111-hashes)
+    - [11.2 No-reference baselines (negative result)](#112-no-reference-baselines-negative-result)
+    - [11.3 30-epoch U-Net (held-out test, 809 images/condition)](#113-30-epoch-u-net-held-out-test-809-imagescondition)
+    - [11.4 U-Net vs Attention U-Net](#114-u-net-vs-attention-u-net)
+  - [12. Adversarial robustness (FGSM / PGD)](#12-adversarial-robustness-fgsm--pgd)
+  - [13. Benign-change controls](#13-benign-change-controls)
+  - [14. Combined metadata + pixel](#14-combined-metadata--pixel)
+  - [15. Conformal calibration and seed sensitivity](#15-conformal-calibration-and-seed-sensitivity)
+    - [Study-level conformal p-values](#study-level-conformal-p-values)
+    - [Seed sensitivity](#seed-sensitivity)
+  - [16. What the paper actually proves](#16-what-the-paper-actually-proves)
+  - [17. Limitations](#17-limitations)
+  - [18. Reproducibility](#18-reproducibility)
+  - [19. Glossary](#19-glossary)
+  - [20. Citation](#20-citation)
 
-- 112 non-contrast cranial CT studies.
-- 92 training studies (8,376 slices), 10 validation studies (980 slices), 10 test studies (809 slices).
-- DICOM slices (`raw.dcm`) plus image/mask arrays and metadata.
-- The Zenodo archive is 5.6 GB.
-- Dataset DOI: https://doi.org/10.5281/zenodo.10892316
-- Download: https://zenodo.org/records/10892316
-- The Zenodo record describes the scans as anonymized using Kitware DicomAnonymizer, with selected demographic/scanner attributes retained.
-- CPAISD contains hyperacute ischemic stroke cases from one center; it is not a general healthy/abnormal brain CT population.
+---
 
-Dataset facts and split counts are from the Zenodo record. Check the record's current license and terms before use/publication; do not infer reuse rights from anonymization alone. Cite Umerenkov, Kudin, Peksheva & Pavlov, CPAISD, Zenodo, DOI 10.5281/zenodo.10892316.
+## 1. The problem
 
-## Why this is much lighter
+A DICOM file = **pixel array + metadata header** (PatientID, Modality, PixelSpacing, SOP/Study/Series UIDs, Manufacturer, ProtocolName, ...).
 
-Default selection uses all official folds:
-- 92 complete training studies
-- 10 complete validation studies
-- 10 complete test studies
+- Edit the header and the image looks identical, so image-only checks miss it.
+- Edit a few pixels and the header is unchanged, so header-only checks miss it.
 
-The selector preserves the dataset's official train/validation/test fold boundaries and chooses whole studies, never random slices. It uses hard links when possible, so the subset does not duplicate the DICOM image bytes on the same NTFS volume.
+Existing work (digital signatures, reversible watermarking, PACS forensics; DICOM PS3.15) mostly needs a **trusted reference, key, or watermark**. Statistical anomaly detectors need none, but "unusual" is not the same as "malicious", and a plausible-but-wrong value may look perfectly normal.
 
-The metadata ML models use DICOM headers only. The metadata SHA-256 reference covers main-dataset and DICOM file-meta elements, excluding PixelData and group-length elements. The separate pixel-integrity experiment decodes and hashes PixelData; it is not part of the metadata-only training run.
+**Research question:** how do hashing, rules, consistency checks, and unsupervised ML behave on the *same* controlled edits, and what does each one miss?
 
-## Windows setup
+---
 
-Download and extract the Zenodo `dataset.zip`. You need the extracted folders `train`, `val`, and `test`. Open CMD in the project folder:
+## 2. Core idea in one paragraph
 
-```cmd
-uv venv
-uv pip install -r requirements.txt
+Build a small, controlled benchmark on public CT data. Apply scripted edits to copies of the clean test files. Run every detector on every edit. Report recall and false-positive rate honestly, including where the "good" numbers are good only by construction (the hash).
+
+The contribution is a **reproducible head-to-head comparison**, not a new algorithm. The paper explicitly does not claim first-ever DICOM tamper detection.
+
+---
+
+## 3. Threat model
+
+Two separate tracks, both closed and non-adaptive:
+
+| Track | Attacker changes | Attacker does NOT change |
+|---|---|---|
+| Metadata | selected header values | PixelData, reference manifest |
+| Pixel | selected stored pixel values | metadata, reference |
+
+Both hash comparators get the **exact clean per-file reference**.
+
+Out of scope: manifest compromise, adaptive attackers (except one feature-collision test), PACS audit-log tampering, sender impersonation, clinical correctness. A mismatch means "differs from the known original", not "malicious".
+
+---
+
+## 4. Dataset and splits
+
+CPAISD, official folds:
+
+| Fold | Studies | Instances |
+|---|---|---|
+| Train | 92 | 8,376 |
+| Validation | 10 | 980 |
+| Test | 10 | 809 |
+
+- All CT, and number of series = number of studies.
+- Stroke annotations are **not used**.
+- In the test fold, PatientID, PatientName, StudyDescription, SeriesDescription are **absent**. ProtocolName and InstitutionName are "Anonymized" everywhere. Manufacturer has two values.
+- Consequence: the PatientID and StudyDescription attacks **insert** missing tags rather than modify existing ones.
+- Pixel experiments decode PixelData only for the 809 test files and their edited copies.
+
+---
+
+## 5. Pipeline overview
+
+```
+Official CPAISD folds (92 / 10 / 10 studies)
+        │
+        ├── Metadata track ──► features ──► fit on clean train ──► calibrate on clean val
+        │                                         │
+        │                       controlled edits on copies of clean test
+        │                                         ▼
+        │                  SHA-256 | Rules | Consistency | IF | AE | OR hybrid
+        │
+        └── Pixel track ──► Pixel SHA | no-ref patch IF | median residual
+                            | header-to-pixel layout | U-Net / Attention U-Net
+                            | FGSM / PGD evasion
+                                         ▼
+              Study alerts + metrics + per-alert explanations
 ```
 
-## Select the small study subset
+Evaluation rules: fit on clean train only, thresholds from clean validation only, a metadata baseline generated per clean test file, attack log gives file-level labels.
 
-Assuming the extracted CPAISD folder is `D:\Datasets\CPAISD`:
+---
 
-```cmd
-uv run python scripts/select_cpaisd_subset.py --input D:\Datasets\CPAISD --output data/real_ct --seed 42
+## 6. Metadata track: detectors
+
+### 6.1 Canonical metadata SHA-256 (reference-based)
+
+Serialize every main-dataset and file-meta (group 0002) element by tag, stringify values, **exclude PixelData and group-length elements**, dump as sorted compact UTF-8 JSON, then hash:
+
+```
+h_i = SHA256( JSON_canonical(M_i) )
 ```
 
-The script creates:
-```text
-data/real_ct/
-  train/
-  val/
-  test/
-  subset_summary.json
+A manifest maps each relative path to its clean digest and records the SOP/Study/Series UIDs. Flag if the path is missing from the manifest or the digest differs.
+
+Not a digital signature. The manifest is built from the same clean files used as controls and is not signed, so the clean FPR is 0 **by construction**.
+
+### 6.2 Structural rules (reference-free)
+
+Flag:
+- missing required tags (SOPClassUID, SOPInstanceUID, StudyInstanceUID, SeriesInstanceUID, Modality, Rows, Columns)
+- non-CT modality
+- non-positive Rows/Columns, invalid PixelSpacing, non-positive SliceThickness
+- a SeriesInstanceUID tied to more than one StudyInstanceUID
+
+The last rule is **contextual**: one bad slice makes its neighbors get flagged too (this causes the file-level label mismatch discussed later).
+
+### 6.3 Study/series consistency checker (reference-free)
+
+Checks that slices sharing an identifier agree.
+
+- **Study level:** PatientID, PatientName, PatientBirthDate, PatientSex, StudyDate
+- **Series level:** StudyInstanceUID, Modality, Manufacturer, ProtocolName, Rows, Columns, SamplesPerPixel, PhotometricInterpretation, BitsAllocated, BitsStored, HighBit, PixelRepresentation, PixelSpacing, ImageOrientationPatient, SliceThickness
+- **Dependencies:** `HighBit = BitsStored - 1`; monochrome PhotometricInterpretation for single-sample CT
+
+A conflict = values disagree, or a tag exists in some members and not others. Groups of fewer than two instances are skipped. Findings propagate to all group members, so evaluation is done **per study**, not per file.
+
+### 6.4 Isolation Forest
+
+300 trees on DictVectorizer features from clean training data, seed 42. Threshold = 1st percentile of clean validation scores. This is an instance-level tail rate, **not** a guaranteed study-level FPR, because slices cluster within studies.
+
+### 6.5 Autoencoder
+
+- Input: DictVectorizer + StandardScaler, fit on clean train
+- Architecture: `d → 32 → 16 → 8 → 4 → 8 → 16 → 32 → d`, ReLU
+- Loss: MSE, 40 epochs, batch 32, lr 1e-3
+- Score: `e_i = (1/d) * ||z_i - f(z_i)||^2`
+- Threshold: 99th percentile of clean validation errors
+
+Optimizer ablation: Adam (baseline), RMSprop, AdamW (wd 1e-4), SGD (momentum 0.9). Everything else held fixed, one seed, no per-optimizer tuning.
+
+### 6.6 Feature representation (important for the results)
+
+- Numeric: rows, columns, bit depth, slice thickness, spacing, rescale params, KVP, tube current
+- Text fields (PatientID, ProtocolName, ...): **only presence and length**, never content
+- Categorical: Manufacturer, Modality, PhotometricInterpretation, BodyPartExamined
+- Missing or non-numeric values map to defaults, so a true zero can look like missing
+
+### 6.7 OR hybrid
+
+```
+y_hat = hash OR rules OR IF OR AE
 ```
 
-It uses hard links if source and destination are on the same NTFS volume. If hard links are unavailable, it copies the files. Keep the extracted original until the subset creation succeeds and verify the subset before deleting anything.
+Recall can never go below any component's recall. FPR can only go up. Not a novel fusion method.
 
-## Verify the selected DICOM data
+---
 
-```cmd
-uv run python scripts/check_dataset.py --input data/real_ct/train
-uv run python scripts/check_dataset.py --input data/real_ct/val
-uv run python scripts/check_dataset.py --input data/real_ct/test
+## 7. Metadata track: attacks
+
+20% of test studies (2 of 10) are selected with seed 42. The same two studies are hit in every variant.
+
+| Attack | What changes | Positives |
+|---|---|---|
+| PatientID | **inserts** absent tag | 177 files |
+| StudyDescription | **inserts** absent tag | 177 files |
+| PixelSpacing | values × 1.7 | 177 files |
+| ProtocolName removal | tag deleted | 177 files |
+| Modality | CT → MR | 177 files |
+| UID inconsistency | one instance per selected series | **2 files** |
+| ProtocolName same-length substitution | 10 chars swapped, length preserved | 177 files |
+| Manufacturer same-length substitution | 7 or 18 chars swapped | 177 files |
+
+Extra conditions:
+- **One-slice edits** (study/series consistency test): PatientID, ProtocolName, Manufacturer, HighBit violation, UID and Modality positive controls, on one instance in each of two studies.
+- **Coordinated edit:** ProtocolName changed in **every** instance of two studies.
+- **Feature-aware evasion:** same-length ProtocolName edit chosen because the feature map ignores content.
+
+---
+
+## 8. Metadata track: results explained
+
+### 8.1 Macro-average (six original attacks, instance level)
+
+| Method | Acc | Prec | Rec | F1 | FPR |
+|---|---|---|---|---|---|
+| SHA-256 reference | 1.000 | 1.000 | 1.000 | 1.000 | 0.000 |
+| Structural rules | 0.818 | 0.169 | 0.333 | 0.170 | 0.036 |
+| Isolation Forest | 0.837 | 0.167 | 0.089 | 0.116 | 0.000 |
+| Autoencoder | 0.825 | 0.408 | 0.667 | 0.506 | 0.171 |
+| OR hybrid | 0.826 | 0.512 | 1.000 | 0.635 | 0.207 |
+
+How to read it:
+- **Hash = 1.000** is expected. The reference came from the same files.
+- **Rules** only catch what they encode, so Modality→MR and UID conflicts. They miss PatientID, StudyDescription, PixelSpacing (still positive and finite), and ProtocolName.
+- **Isolation Forest** only partly catches PixelSpacing (about 54% of edited files). It misses everything else.
+- **Autoencoder** flags all edits for four of the five whole-study attacks, but misses Modality, and has **13.8% clean file FPR** (112 of 809 clean files).
+- **Hybrid recall 1.000** is inherited from the hash. FPR rises because the AE's false alarms are OR-ed in. This is not evidence that ML improves integrity.
+
+### 8.2 Per-attack detail (recall / FPR)
+
+| Attack | n+ | SHA-256 | Rules | IF | AE | OR |
+|---|---|---|---|---|---|---|
+| PatientID | 177 | 1.00/0.00 | 0.00/0.00 | 0.00/0.00 | 1.00/0.18 | 1.00/0.18 |
+| StudyDescription | 177 | 1.00/0.00 | 0.00/0.00 | 0.00/0.00 | 1.00/0.18 | 1.00/0.18 |
+| PixelSpacing | 177 | 1.00/0.00 | 0.00/0.00 | 0.54/0.00 | 1.00/0.18 | 1.00/0.18 |
+| UID inconsistency | 2 | 1.00/0.00 | 1.00/0.22 | 0.00/0.00 | 0.00/0.14 | 1.00/0.36 |
+| Protocol removal | 177 | 1.00/0.00 | 0.00/0.00 | 0.00/0.00 | 1.00/0.18 | 1.00/0.18 |
+| Modality change | 177 | 1.00/0.00 | 1.00/0.00 | 0.00/0.00 | 0.00/0.18 | 1.00/0.18 |
+
+**Why the AE catches PatientID/StudyDescription:** these tags were absent everywhere, so inserting them changes the presence/length features. That's a *presence shift*, not semantic detection.
+
+### 8.3 UID inconsistency: label granularity issue
+
+The rule flags **all** slices in the inconsistent series (177 files), but only 2 edited files are labeled positive, giving 175 "false positives" at file level. At **series level** (the right unit) the rule gets recall 1.000, FPR 0.000 (2/2 series, 0/8 false).
+
+### 8.4 Same-length substitutions
+
+| Attack | SHA-256 | IF | AE |
+|---|---|---|---|
+| ProtocolName | 1.00/0.00 | 0.00/0.00 | 0.00/0.177 |
+| Manufacturer | 1.00/0.00 | 0.00/0.00 | 1.00/0.177 |
+
+AE catches Manufacturer (it's a categorical feature) but not ProtocolName (content ignored). Descriptive for these specific substitutions only.
+
+### 8.5 Study/series consistency checker
+
+On clean data: **zero findings**. On six one-slice edits (2 positive studies, 8 negative each):
+
+| Condition | Structural rules | Consistency |
+|---|---|---|
+| PatientID | 0.00/0.00 | 1.00/0.00 |
+| ProtocolName | 0.00/0.00 | 1.00/0.00 |
+| Manufacturer | 0.00/0.00 | 1.00/0.00 |
+| HighBit violation | 0.00/0.00 | 1.00/0.00 |
+| Study UID (control) | 1.00/0.00 | 1.00/0.00 |
+| Modality (control) | 1.00/0.00 | 1.00/0.00 |
+
+It marks 151 to 177 instances per condition because findings propagate to peers. Those are not file-level precision numbers, and the checker can't say *which* slice is the odd one out.
+
+### 8.6 The coordinated edit (the checker's limit)
+
+| Condition | Consistency | Structural | Metadata hash |
+|---|---|---|---|
+| One instance per study | 2/2 | 0/2 | 2/2 |
+| **Every** instance in study | **0/2** | 0/2 | 2/2 |
+
+If every slice carries the same wrong value, the group is internally consistent and the checker sees nothing. Only the reference hash catches it. This is the paper's cleanest illustration of **internal consistency vs. reference verification**.
+
+### 8.7 Feature-aware adaptive evasion
+
+Same-length ProtocolName substitution on 177 files:
+- Feature vectors are **exactly unchanged**
+- IF score and AE error change by exactly **0**
+- Rules, IF, AE: **0/177**. Hash: **177/177**
+
+Lesson: an unsupervised model cannot detect information discarded before it sees the input. This is a representation blind spot, not a clever optimizer.
+
+### 8.8 Optimizer comparison (AE, 40 epochs, seed 42)
+
+| Optimizer | Attack F1 (file / study) | Attack FPR (file / study) | Clean FPR (file / study) |
+|---|---|---|---|
+| Adam | 0.506 / 0.533 | 0.171 / 0.125 | 0.1384 / 0.100 |
+| RMSprop | **0.831 / 0.667** | 0.002 / 0.125 | **0.0012** / 0.100 |
+| AdamW | 0.551 / 0.617 | 0.178 / 0.125 | 0.1446 / 0.100 |
+| SGD (m=0.9) | 0.611 / 0.533 | 0.049 / 0.125 | 0.0396 / 0.100 |
+
+RMSprop wins in this fixed setup, but: one seed, shared untuned lr, ten test studies. All four optimizers flag 1 of 10 clean studies. A candidate result, not an optimizer recommendation.
+
+### 8.9 Header-to-pixel layout checker
+
+Reference-free. Checks that Rows/Columns/SamplesPerPixel/NumberOfFrames/bit-depth are valid, that uncompressed PixelData length matches the declared dimensions, that decoded shape matches the header, and that decoded values fit BitsStored/PixelRepresentation.
+
+Results: 0 findings on 809 clean files; **177/177** Rows-mismatch and **177/177** Columns-mismatch caught; 0 flags on pixel-only edits (layout stays valid). These contradictions are deliberately obvious. It doesn't catch plausible-but-wrong metadata that still fits the payload.
+
+---
+
+## 9. Pixel track: detectors
+
+1. **Pixel SHA-256** over raw PixelData vs a per-file clean digest (exact-reference control). Metadata SHA-256 serves as a **negative control** (it excludes PixelData).
+2. **No-reference patch Isolation Forest:** robust scaling by the 1st/99th percentile, non-overlapping 16×16 patches, 6 features (mean, std, horizontal/vertical gradients, high-deviation fraction, log-std). 100 trees on 50,000 clean patches from 2,084 training slices. Localization is coarse (16×16 blocks).
+3. **Median-filter residual:** `R = |I - Median5x5(I)|`, pixel threshold at the 99.9th percentile of clean validation residuals, image threshold at the 99th percentile of image scores.
+4. **Compact U-Net** (supervised, no reference):
+   - base width 8, widths 8-16-32-64-128 down, 64-32-16-8 up, skip connections, 1×1 conv to logits
+   - input robustly normalized and resized to 256×256
+   - loss = 0.5 weighted BCE (pos weight 12) + 0.5 soft Dice, AdamW lr 1e-3, wd 1e-4
+   - trained on synthetic localized patches + sparse low-amplitude edits; **copy-move withheld** as an unseen family
+   - thresholds from clean validation: pixel = 99.5th percentile, image = 99th percentile of image-max probabilities
+5. **Attention U-Net:** same everything, plus attention gates on each skip connection (encoder skip weighted by a sigmoid map from decoder context).
+
+---
+
+## 10. Pixel track: attacks
+
+All edits are made in the **stored integer domain** (no RescaleSlope/Intercept applied, so not HU).
+
+| Attack | Default parameters | Files |
+|---|---|---|
+| Localized patch | +32 on central 5×5, every slice of selected studies | 177 |
+| Low-amplitude | +1 on random 1% of pixels per slice | 177 |
+| Slice inconsistency | +8 on central 5×5, one slice per selected series | 2 |
+
+Severity sweep:
+
+| Family | Subtle | Default | Stronger |
+|---|---|---|---|
+| Patch | 3×3, +1 | 5×5, +32 | 9×9, +32 |
+| Sparse | 0.1%, +1 | 1%, +1 | 5%, +2 |
+| Slice | 3×3, +1 | 5×5, +8 | 9×9, +32 |
+
+The difference map is `D(u,v) = |P'(u,v) - P(u,v)|`. A mask-vs-`D>0` comparison gives IoU 1.000 **by construction** because both come from the same script. It validates bookkeeping, not localization ability.
+
+---
+
+## 11. Pixel track: results explained
+
+### 11.1 Hashes
+
+| Attack | Pixel SHA-256 | Metadata SHA-256 |
+|---|---|---|
+| Localized patch | 1.00/0.00 | 0.00/0.00 |
+| Low-amplitude | 1.00/0.00 | 0.00/0.00 |
+| Slice inconsistency | 1.00/0.00 | 0.00/0.00 |
+
+Pixel hash catches everything at all nine attack/severity combos. Any changed byte changes the digest. Metadata hash catching nothing is the expected negative control. This says nothing about the smallest *clinically meaningful* change.
+
+### 11.2 No-reference baselines (negative result)
+
+- **Patch IF:** image-level FPR 0.0111; detected **no attacked image** at its threshold; localization recall about 0 (IoU 0.0034 on low-amplitude).
+- **Median residual:** clean image alarm 8.78%; recall 6.21% (patch), 5.65% (low-amplitude), 0% (slice); IoU about 0.
+
+Tiny edits are statistically invisible against normal CT texture. A no-reference detector is much harder than exact-reference hashing.
+
+### 11.3 30-epoch U-Net (held-out test, 809 images/condition)
+
+| Family | n+ | AUROC | Img recall | Img FPR | Img F1 | Px precision | Px recall | Px IoU |
+|---|---|---|---|---|---|---|---|---|
+| Patch | 236 | 0.984 | 0.996 | 0.030 | 0.963 | 0.376 | 0.999 | 0.376 |
+| Sparse | 152 | 0.986 | 1.000 | 0.027 | 0.944 | 0.339 | 0.964 | 0.335 |
+| Copy-move (unseen) | 139 | 0.972 | 0.885 | 0.024 | 0.885 | 0.424 | 0.812 | 0.386 |
+
+- Epoch 30 chosen by validation macro IoU (0.9254). Validation numbers are **not independent** (used for selection).
+- Image-level numbers look great, but **pixel precision is only 0.34 to 0.42** (lots of highlighted pixels outside the true mask) and **study-level FPR is 0.50 to 0.625** (recall 1.0).
+- Clean image FPR: 2.84%.
+- The 4-epoch pilot is superseded (recall ≤ 0.114).
+
+### 11.4 U-Net vs Attention U-Net
+
+| Metric | U-Net | Attention |
+|---|---|---|
+| Best epoch | 30 | 28 |
+| Val IoU | 0.9254 | 0.9322 |
+| Clean image FPR | 2.84% | 3.83% |
+| Patch IoU | 0.376 | 0.397 |
+| Sparse IoU | 0.335 | **0.214** |
+| Copy-move IoU | 0.386 | 0.420 |
+| Image F1 | higher on all three families | lower on all three |
+
+Study-level results are identical. Net effect: **family-dependent, no overall win for attention**.
+
+---
+
+## 12. Adversarial robustness (FGSM / PGD)
+
+Setup: the trained U-Net, no retraining. Targeted white-box attack minimizing BCE against an **all-clean mask** to suppress the tamper alarm. Budget `L_inf = 0.02` on the normalized [0,1] input. PGD: 10 steps, step 0.004, random start. Thresholds stay fixed from clean validation. Only edited positive images are attacked. Attack success rate (ASR) = fraction of baseline-detected images that fall below the alarm threshold afterward.
+
+| Family | Baseline recall | FGSM recall | FGSM ASR | PGD recall | PGD ASR | PGD IoU |
+|---|---|---|---|---|---|---|
+| Patch | 0.996 | 0.877 | 0.119 | 0.097 | 0.902 | 0.081 |
+| Sparse | 1.000 | 0.217 | 0.783 | **0.000** | 1.000 | 0.117 |
+| Copy-move | 0.885 | 0.547 | 0.390 | 0.173 | 0.805 | 0.057 |
+
+Meaning: this checkpoint is highly evadable by a small targeted white-box perturbation. Not shown: that such perturbations are clinically plausible, survive serialization back into DICOM/HU, or transfer to other detectors. An exact-reference PixelData hash would still catch the serialized change.
+
+---
+
+## 13. Benign-change controls
+
+Three proxies applied to all 809 clean files (PixelData and non-target clinical attributes verified unchanged):
+
+1. File-meta `ImplementationVersionName` update
+2. Limited privacy-cleanup proxy (de-id markers)
+3. Re-serialization through pydicom, no attribute edit
+
+| Method | File-meta update | Privacy cleanup | Re-serialize |
+|---|---|---|---|
+| Metadata SHA-256 | 1.000 | 1.000 | **0.000** |
+| Structural rules | 0 | 0 | 0 |
+| Isolation Forest | 0 | 0 | 0 |
+| Autoencoder | 0.138 (0 new) | 0.138 (0 new) | 0.138 (0 new) |
+| OR hybrid | 1.000 (0.861 new) | 1.000 (0.861 new) | 0.138 (0 new) |
+
+The strict hash answers "did a covered value change?", **not** "is it malicious?". It alarms on harmless workflow edits. The AE's 112 alarms are the same pre-existing clean-file alarms, nothing newly triggered. Takeaway: test on real PACS exports before treating a hash mismatch as a security alarm.
+
+---
+
+## 14. Combined metadata + pixel
+
+Corrected run: metadata edits seed 42, pixel edits seed 44, giving **disjoint** study pairs. Per condition: 177 metadata files + 133 pixel files = **310 unique positives**.
+
+| Detector | Recall | FPR |
+|---|---|---|
+| Metadata SHA-256 | 0.571 | 0.000 |
+| PixelData SHA-256 | 0.429 | 0.000 |
+| **OR of hashes** | **1.000** | 0.000 |
+
+(Initial run used the same seed for both, so both hashes hit the same studies. That was fixed.) This shows two exact-reference checks cover complementary attack surfaces. It is not learned fusion and doesn't work without a trusted reference.
+
+---
+
+## 15. Conformal calibration and seed sensitivity
+
+### Study-level conformal p-values
+
+Per-study score = max anomaly severity over its slices (`-s_IF` for IF, reconstruction error for AE).
+
+```
+p(q) = (1 + sum_j 1[q_j^(v) >= q]) / (n_v + 1)
 ```
 
-## Run the entire experiment
+Alert when `p(q) <= alpha`. With only **10 validation studies**, the smallest possible p is 1/11 ≈ 0.091.
 
-```cmd
-uv run python scripts/run_research_experiment.py --input data/real_ct --workdir experiment_cpaisd --seed 42 --epochs 40 --attack-fraction 0.20
+| alpha | Result |
+|---|---|
+| 0.05 | No alert can ever fire |
+| 0.10 | Clean-test study FPR: IF 0.000, AE 0.100 |
+| 0.20 | Clean-test study FPR jumps: IF 0.300, AE 0.600 |
+
+At alpha = 0.10, IF detects PixelSpacing; AE detects Manufacturer and PixelSpacing but misses Modality and UID events. The nominal level gives **no population-level guarantee**.
+
+### Seed sensitivity
+
+Four attacks repeated with study-selection seeds 42/43/44, with a 2,000-resample stratified study/series bootstrap. AE study FPR is about 0.125 with CIs such as [0.000, 0.250]. Recall intervals are degenerate (0 or 1), since each detector makes the same decision on both attacked studies. The seeds reuse the same ten studies, so this does **not** give independent-site evidence.
+
+---
+
+## 16. What the paper actually proves
+
+**Supported:**
+- A reference hash catches every changed file by construction.
+- Rules and consistency checks catch only the violations they encode.
+- Consistency checks miss coordinated, internally consistent edits.
+- Learned detectors can't see anything the feature map drops (ProtocolName content).
+- OR-fusion inherits the hash's recall and the ML models' false alarms.
+- Simple no-reference pixel detectors fail on tiny scripted edits.
+- A supervised U-Net localizes well on its own synthetic edits but has low pixel precision, high study-level FPR, and is easy to evade with a small white-box PGD attack.
+- Strict hashes alarm on benign metadata rewrites.
+
+**Not supported:**
+- Clinical utility, real-world tamper detection
+- Cross-site / external generalization
+- Robustness to broad adaptive attackers
+- That RMSprop is generally best, or that attention helps
+- That ML improves on cryptographic verification
+
+---
+
+## 17. Limitations
+
+1. Single-center, 112-study cohort; test fold = **10 studies**
+2. Synthetic scripted attacks; benign-like controls are proxies, not named PACS outputs
+3. Reference manifest built from the same clean test files, not signed
+4. Series/file label mismatch for the UID attack (reported at series level instead)
+5. Text fields reduced to presence/length; unknown categories may be dropped by the vectorizer
+6. Optimizer comparison: one seed, shared untuned lr
+7. Semantic checker assumes within-study stability; mixed-vendor or re-export variation could break it; findings identify a group, not a slice
+8. Coordinated-edit test: two studies, one field, one substitution
+9. Software versions and hardware not fully recorded
+10. Pixel track: capped 512-image training set, resized 256×256 grid, edits not in HU, adversarial examples not serialized to DICOM, clean-image adversarial FPR not measured
+11. Seed/bootstrap analysis reuses the same ten studies
+12. Conformal calibration limited to 10 validation studies
+13. Layout attacks are obvious (Rows/Columns); plausible-but-consistent edits untested
+14. Explanations (AE feature contributions) are diagnostic, not causal; a hash can't say which tag changed
+15. No clinical, forensic, sender-authentication, or intent validation
+
+---
+
+## 18. Reproducibility
+
+Common settings: seed 42, 20% study attack fraction, CPU runs.
+
+| Experiment | Key settings |
+|---|---|
+| Metadata + optimizer comparison | all 8,376 / 980 / 809 files, 40 epochs, batch 32, lr 1e-3 |
+| 30-epoch U-Net | 512 capped train images, batch 8, 256×256, about 49 min (2,946 s), epoch 30 selected |
+| Attention U-Net | same setup, epoch 28 selected |
+| FGSM/PGD | eps 0.02, 10 PGD steps, step 0.004; 236 / 152 / 139 positive images |
+| Combined run | metadata seed 42, pixel seed 44, 310 unique positives |
+
+Output folders named in the paper:
+
+```
+experiment_cpaisd_semantic_consistency/
+experiment_cpaisd_coordinated_metadata/
+experiment_cpaisd_supervised_localization/              # 4-epoch pilot (superseded)
+experiment_cpaisd_supervised_localization_512_30ep_*/   # completed U-Net run
+experiment_cpaisd_attention_unet_512_30ep/
+experiment_cpaisd_unet_fgsm_pgd/
 ```
 
-Or run:
-```cmd
-RUN_REAL_CPAISD.cmd
+> A public, versioned code archive has **not yet been deposited**. An external-evaluation script exists but no external cohort was run (CQ500 is a candidate). Dataset: [Zenodo 10.5281/zenodo.10892316](https://doi.org/10.5281/zenodo.10892316); follow its license and citation terms.
+
+---
+
+## 19. Glossary
+
+| Term | Meaning |
+|---|---|
+| DICOM | Standard format combining image pixels and a metadata header |
+| SOP / Study / Series UID | Unique IDs for an instance, a study, and a series |
+| PixelData | The raw pixel payload element (7FE0,0010) |
+| FPR | False positive rate = FP / (FP + TN) |
+| Recall | TP / (TP + FN) |
+| Macro average | Unweighted mean across attack types |
+| Isolation Forest | Unsupervised outlier detector based on random partitioning |
+| Autoencoder | Network trained to reconstruct clean inputs; high error = anomaly |
+| Conformal p-value | Rank of a score among clean calibration scores |
+| FGSM / PGD | One-step / iterative gradient-sign adversarial attacks |
+| ASR | Attack success rate: baseline-detected images that become undetected |
+| IoU / Dice | Overlap measures between predicted and true masks |
+| Feature collision | An edit that leaves the model's input vector unchanged |
+| HU | Hounsfield units (CT intensity scale) |
+
+---
+
+## 20. Citation
+
+```bibtex
+@misc{gupta_dicom_integrity,
+  title  = {Reference-Based Integrity Checking and Metadata Anomaly Detection for DICOM Brain CT: A Controlled Study of Metadata and Pixel Tampering},
+  author = {Gupta, Aditya Upendra and Awasthi, Aaditya and Nidal and Sudhawalli},
+  note   = {Manuscript}
+}
 ```
 
-## What the pipeline does
-
-1. Checks the three official folds.
-2. Trains Isolation Forest on clean training metadata and calibrates its score threshold on clean validation metadata (1st percentile; nominal 1% calibration-tail rate).
-3. Trains the metadata Autoencoder on clean training metadata and calibrates its threshold on validation metadata.
-4. Builds a metadata SHA-256 baseline on clean test files.
-5. Measures false positives on untouched clean test data.
-6. Creates eight controlled metadata attack conditions on copies of test files, selecting studies rather than individual slices. PatientID and StudyDescription are inserted because those attributes are absent in this CPAISD test fold; two added conditions make same-length substitutions in populated ProtocolName and Manufacturer fields.
-7. Runs the hybrid detector and ablation.
-8. Writes per-attack instance-, study-, and series-level metrics, macro averages, clean false-positive rates, plots, and a report.
-
-## Outputs
-
-```text
-experiment_cpaisd/
-  models/
-  attacks/
-    patient_id/
-    study_description/
-    protocol_name_same_length/
-    manufacturer_same_length/
-    pixel_spacing/
-    study_uid_inconsistency/
-    remove_protocol/
-    modality/
-  reports/
-    test_baseline.json
-    clean_test_predictions.csv
-    clean_test_false_positive_rates.csv
-    clean_test_study_false_positive_rates.csv
-    per_attack_metrics.csv
-    per_attack_study_metrics.csv
-    macro_average_metrics.csv
-    macro_average_study_metrics.csv
-    f1_by_attack.png
-    clean_test_fpr.png
-    experiment_config.json
-    RESEARCH_REPORT.md
-```
-
-## Separate pixel-integrity experiment
-
-The main experiment above is metadata-only. To run the additional pixel-level
-experiment after preparing the clean CPAISD folds, use a **new, empty output
-directory** so its outputs remain separate from the metadata results:
-
-```cmd
-uv run python scripts/run_pixel_integrity_experiment.py --input data/cpaisd/test --output experiment_cpaisd_pixel --attack-fraction 0.20 --seed 42
-```
-
-It creates three reproducible synthetic pixel-only conditions on copies of
-selected test studies: a central localized patch, sparse low-amplitude pixel
-perturbations, and one altered slice per selected series. It compares a raw
-PixelData SHA-256 reference with metadata SHA-256 as a negative control. The
-hash baseline requires a trusted reference and is not an image anomaly model.
-Edits are applied to stored integer pixel values without applying the DICOM
-rescale slope/intercept; the defaults are +32 on a central 5x5 patch, +1 to a
-seeded 1% of pixels, and +8 on one 5x5 patch per selected series, respectively.
-The initial editor supports uncompressed single-frame 2-D integer CT images;
-compressed or other pixel encodings stop with an explanatory error. Original
-dataset files are not modified.
-
-Outputs are written under `experiment_cpaisd_pixel/`: `attacks/`,
-`clean_pixel_baseline.json`, `pixel_predictions.csv`, `pixel_metrics.csv`,
-`pixel_difference_summary.csv`, representative images under `heatmaps/`,
-`pixel_localization_metrics.csv`, packed per-instance masks under each attack's
-`ground_truth_masks/`, `experiment_config.json`, and `PIXEL_EXPERIMENT_REPORT.md`.
-The localization check thresholds the exact clean-reference difference at zero
-and compares it with the synthetic edit mask; it validates mask/difference
-alignment, not detector localization performance. The per-file CSV
-includes changed-pixel count/fraction, mean absolute difference, RMSE, and
-maximum difference; the summary CSV reports means over modified images.
-Heatmaps show clean reference, modified image,
-and absolute difference; color scaling is per image, so use the CSV for numeric
-comparison. Set `--heatmaps-per-attack 0` to disable image generation. Keep this as a
-separate experiment from the metadata metrics; pixel hashing detects change
-against a clean reference, while it does not identify whether a change is
-malicious or clinically meaningful.
-
-## Train a no-reference pixel anomaly baseline
-
-The patch-level Isolation Forest uses clean training images, calibrates
-thresholds on clean validation images, and evaluates the saved synthetic pixel
-masks. It scores each image independently and does not compare against its clean
-original during prediction:
-
-```cmd
-uv run python scripts/run_no_reference_pixel_experiment.py --train data/cpaisd/train --validation data/cpaisd/val --test data/cpaisd/test --attacks-root experiment_cpaisd_pixel/attacks --output experiment_cpaisd_no_reference_pixel --seed 42
-```
-
-To reuse that trained patch Isolation Forest while adding a median-filter
-residual comparator (thresholds are recalibrated on validation data), run it
-into a new output folder:
-
-```cmd
-uv run python scripts/run_no_reference_pixel_experiment.py --train data/cpaisd/train --validation data/cpaisd/val --test data/cpaisd/test --attacks-root experiment_cpaisd_pixel_masks/attacks --output experiment_cpaisd_no_reference_v2 --seed 42 --pretrained-model experiment_cpaisd_no_reference_pixel/no_reference_pixel_model.joblib
-```
-
-## Repeat metadata attacks across seeds
-
-This repeats four representative attacks with different study-selection seeds
-and reports per-run metrics plus descriptive study- and series-level bootstrap
-intervals. The intervals are based on the ten CPAISD test studies and are not
-external-population confidence intervals. Choose a new output folder:
-
-```cmd
-uv run python scripts/run_seed_sensitivity.py --input data/cpaisd/test --baseline experiment_cpaisd/research_extensions_v2/test_baseline.json --metadata-model experiment_cpaisd/models/isolation_forest.joblib --autoencoder-model experiment_cpaisd/models/metadata_autoencoder.joblib --output experiment_cpaisd_seed_sensitivity --seeds 42 43 44 --attacks modality pixel_spacing manufacturer_same_length study_uid_inconsistency --attack-fraction 0.20 --bootstrap-iterations 2000
-```
-
-After that completes, regenerate stratified bootstrap intervals from the saved
-study/series predictions (resampling positive and negative groups separately):
-
-```cmd
-uv run python scripts/summarize_seed_sensitivity.py --input experiment_cpaisd_seed_sensitivity --iterations 2000
-```
-
-## Live classroom demo
-
-Launch the interactive dashboard:
-
-```cmd
-uv run streamlit run dashboard/app.py
-```
-
-The app automatically loads `data/cpaisd/test`, the trained metadata models,
-the saved no-reference pixel model, and the completed 30-epoch U-Net checkpoint
-from `experiment_cpaisd_supervised_localization_512_30ep_complete` when available. No upload or
-sidebar path setup is needed. In **Interactive attack lab**, choose a slice and choose **Metadata
-only**, **Pixels only**, or **Metadata + pixels**. Pick the edit and click
-**Apply change and show everything**. The app displays all implemented checks
-side by side plus clean/edited CT images, a reference-difference heatmap, the
-U-Net probability heatmap, and its thresholded mask overlay. A sensitivity
-slider updates the mask and alert, reports single-slice precision/recall and
-clean-slice alarm fraction, and offers a downloadable five-threshold CSV. Those
-single-slice measures are for demonstration, not test-set estimates. Pixel
-options include a localized patch, sparse edit, and a copy-move patch from the U-Net's
-withheld synthetic attack family. The **Experiments completed** tab
-shows saved metric tables and U-Net localization examples. It edits only temporary copies; the preloaded
-dataset remains unchanged. These are controlled examples, not judgments about
-intent or clinical harm. **Experiments completed** shows saved CSV result
-tables from prior runs.
-
-## New research extensions
-
-These extensions have already been run in this workspace; their result folders
-are `experiment_cpaisd_cross_layer`, `experiment_cpaisd_adaptive_evasion`,
-`experiment_cpaisd_benign_vs_attack`, `experiment_cpaisd_study_calibration`,
-and `experiment_cpaisd_semantic_consistency`.
-The commands below are for reproduction. Each script requires an empty output
-folder, so use a different `--output` name when rerunning.
-
-### Supervised pixel-tamper localization with an unseen attack family
-
-This experiment trains a compact U-Net on synthetic localized-patch and
-sparse-pixel masks from the clean training fold. It calibrates pixel and image
-thresholds on clean validation images, then evaluates on held-out studies. A
-copy-move edit family is deliberately withheld from training to measure transfer
-to one unseen synthetic edit type. The model sees each image alone at test time;
-it does not use a clean-reference image or hash. Results use a resized 256x256
-model grid, not native-resolution clinical masks.
-
-For a longer CPU run, limit training to 512 slices and allow up to 30 epochs.
-At every epoch the runner scores a fixed synthetic-mask validation subset and
-saves the checkpoint with the best macro pixel IoU; the test fold is not used
-to choose the epoch:
-
-```cmd
-uv run python scripts/run_supervised_pixel_localization.py --train data/cpaisd/train --validation data/cpaisd/val --test data/cpaisd/test --output experiment_cpaisd_supervised_localization_512_30ep --max-train-files 512 --epochs 30 --batch-size 8 --image-size 256 --seed 42
-```
-
-For the full official training fold, use `--max-train-files 0` (or omit the
-option) and keep in mind that CPU runtime will rise substantially. The
-test fold remains the full official test set unless `--max-test-files` is set.
-Outputs include the checkpoint, training loss, file/study metrics, pixel Dice
-and IoU by epoch on synthetic validation masks, the selected best epoch, file/study
-test metrics, and example clean/edit/ground-truth/predicted maps. Do not report
-results until the run completes. The withheld copy-move test remains synthetic,
-and the test fold contains only ten studies.
-
-### Header-to-pixel layout consistency
-
-This checks whether declared DICOM rows/columns, frames, sample layout, and
-stored pixel payload agree. It uses no clean image or hash reference. The
-pixel-only attack is a negative control because it changes pixel values while
-preserving their layout:
-
-```cmd
-uv run python scripts/run_cross_layer_consistency_experiment.py --input data/cpaisd/test --output experiment_cpaisd_cross_layer --pixel-negative-control experiment_cpaisd_pixel_masks/attacks/low_amplitude --attack-fraction 0.20 --seed 42
-```
-
-### Feature-aware adaptive evasion
-
-This tests a same-length ProtocolName substitution chosen to collide with the
-metadata feature representation. Reference hashing is retained as a control:
-
-```cmd
-uv run python scripts/run_adaptive_metadata_evasion.py --input data/cpaisd/test --baseline experiment_cpaisd/research_extensions_v2/test_baseline.json --metadata-model experiment_cpaisd/models/isolation_forest.joblib --autoencoder-model experiment_cpaisd/models/metadata_autoencoder.joblib --output experiment_cpaisd_adaptive_evasion --attack-fraction 0.20 --seed 42
-```
-
-### Compare benign-change alarms with attack detection
-
-Run a broader controlled comparison with three benign-like proxies (a file-meta
-implementation-version update, limited privacy-field cleanup, and lossless
-re-serialization) and the existing scripted attacks. The script copies source
-files, checks whether pixels and non-target clinical attributes stay unchanged,
-and writes detector alarm rates. These transformations label the experiment's
-conditions; they do not tell whether a real-world change was malicious:
-
-```cmd
-uv run python -m src.cli baseline --input data/cpaisd/test --manifest experiment_cpaisd_benign_attack_baseline.json
-uv run python scripts/run_benign_vs_attack_experiment.py --input data/cpaisd/test --manifest experiment_cpaisd_benign_attack_baseline.json --model experiment_cpaisd/models/isolation_forest.joblib --ae-model experiment_cpaisd/models/metadata_autoencoder.joblib --attacks-root experiment_cpaisd/attacks --output experiment_cpaisd_benign_attack_v3
-```
-
-Outputs include `benign_vs_attack_summary.csv`,
-`benign_transformation_audit.csv`, `benign_transformation_audit_summary.csv`,
-and `BENIGN_VS_ATTACK_REPORT.md`. The runner verifies that the manifest matches
-the current clean input and compares benign alarms with the same files' clean
-predictions. The
-privacy-field cleanup is a limited synthetic proxy, not a complete
-standards-conformant de-identification process. Use a fresh `--output` folder
-for every run.
-
-### Study/series metadata consistency
-
-This checks whether selected values agree among slices in one study or series
-(for example, PatientID, ProtocolName, Manufacturer, image layout, and related
-pixel-representation fields). The experiment changes one instance in two
-studies and reports at the study level because a group conflict can implicate
-peer slices. It does not prove intent, and a coordinated edit applied
-consistently to an entire group may evade the check:
-
-```cmd
-uv run python scripts/run_semantic_metadata_experiment.py --input data/cpaisd/test --output experiment_cpaisd_semantic_consistency_rerun --attack-fraction 0.20 --seed 42
-```
-
-The saved run detected both affected studies for four single-slice conditions
-missed by basic structural rules, with no false alarms among the eight
-unaffected studies per condition. The test fold has only ten studies, so treat
-these results as exploratory.
-
-### Calibrate alerts at study level
-
-This uses the validation fold to calibrate study-level Isolation Forest and
-autoencoder anomaly scores, then reports clean-test and saved attack results.
-With only ten validation studies, conformal threshold resolution is coarse:
-
-```cmd
-uv run python scripts/run_study_level_calibration.py --validation data/cpaisd/val --test data/cpaisd/test --test-baseline experiment_cpaisd/research_extensions_v2/test_baseline.json --metadata-model experiment_cpaisd/models/isolation_forest.joblib --autoencoder-model experiment_cpaisd/models/metadata_autoencoder.joblib --attack-predictions-root experiment_cpaisd_seed_sensitivity/evaluations --output experiment_cpaisd_study_calibration
-```
-
-The standard detector predictions now also include `alert_sources`, a readable
-`alert_explanation`, and the autoencoder's largest feature-wise reconstruction
-errors. Hash alerts say that a reference digest differs; the hash itself cannot
-identify the altered tag.
-
-It saves image alarm metrics, coarse 16x16-block anomaly maps, mask-based
-localization scores, and clean-test alarm rates. This handcrafted baseline is
-exploratory and can miss subtle changes; use the measured results rather than
-assuming that an added image detector improves detection.
-
-To run a predefined subtle/default/stronger perturbation sweep in a separate
-fresh directory:
-
-```cmd
-uv run python scripts/run_pixel_integrity_experiment.py --input data/cpaisd/test --output experiment_cpaisd_pixel_sweep --attack-fraction 0.20 --seed 42 --severity-sweep
-```
-
-The sweep settings are recorded per severity subfolder; its top-level
-`severity_sweep_metrics.csv` collects the hash-based results. To evaluate
-paired metadata and pixel edits, run:
-
-```cmd
-uv run python scripts/run_combined_integrity_experiment.py --input data/cpaisd/test --output experiment_cpaisd_combined --metadata-attacks patient_id modality --pixel-attacks localized_patch low_amplitude --attack-fraction 0.20 --seed 42
-```
-
-Combined outputs include per-file predictions and file-/study-level metrics
-for metadata hash, pixel hash, and their OR. These remain trusted-reference
-comparators and are not a learned multimodal detector. Metadata and pixel
-attacks use independent study-selection seeds (`seed` and `seed + 2`) so the
-test can contain metadata-only and pixel-only positive instances; inspect the
-logged overlap rather than assuming the selected studies are disjoint for every
-dataset or seed. Each experiment needs a fresh output directory; the scripts
-preserve existing results.
-
-## Evaluate on a second DICOM cohort
-
-To measure transfer of the CPAISD-trained metadata models, place a separate
-cohort such as CQ500 in a folder containing readable DICOM files, then run:
-
-```cmd
-uv run python scripts/run_external_dataset_evaluation.py --input D:\Datasets\CQ500 --output experiment_cq500_external --metadata-model experiment_cpaisd\models\isolation_forest.joblib --autoencoder-model experiment_cpaisd\models\metadata_autoencoder.joblib --attacks modality pixel_spacing manufacturer_same_length --attack-fraction 0.20 --seed 42
-```
-
-This reports alarms on untouched external files and performance on controlled
-edits. The script builds a clean external reference for hash comparisons, so
-hash performance on those edits is expected; use the rules and learned-model
-results to inspect transfer behavior. CQ500 is a hemorrhage head-CT cohort,
-not an ischemic-stroke cohort. Follow its non-commercial license and end-user
-agreement. No CQ500 results are included until the external data are supplied
-and the evaluation is run.
-
-To measure alarms from a benign-like DICOM file-meta update, run the following
-after the main experiment has created the baseline and models:
-
-```cmd
-uv run python scripts/run_benign_reserialization.py --input data/cpaisd/test --output experiment_cpaisd_reserialization --manifest experiment_cpaisd/reports/test_baseline.json --model experiment_cpaisd/models/isolation_forest.joblib --ae-model experiment_cpaisd/models/metadata_autoencoder.joblib
-```
-
-This control changes `ImplementationVersionName` to a synthetic receiver
-identifier while keeping the clinical dataset attributes and PixelData fixed.
-It measures strict-hash sensitivity to a benign-like header update; it is not a
-simulation of a named PACS product. Use a fresh output path for each run.
-
-## Autoencoder optimizer comparison
-
-To compare the existing Adam optimizer with RMSprop, AdamW, and SGD with
-momentum on the same CPAISD folds and six metadata attacks, run:
-
-```cmd
-uv run python -m scripts.run_autoencoder_optimizer_comparison --train data/cpaisd/train --validation data/cpaisd/val --test data/cpaisd/test --attacks experiment_cpaisd/attacks --output experiment_cpaisd/reports/autoencoder_optimizer_comparison --epochs 40 --batch-size 32 --learning-rate 0.001 --threshold-percentile 99 --seed 42
-```
-
-The script fits each model on clean training metadata, calibrates its threshold
-on clean validation data, and writes `optimizer_summary.csv`,
-`per_attack_metrics.csv`, a run configuration, and the model files. Each output
-directory must be new or empty. The comparison uses one seed and common
-hyperparameters; repeat it with other seeds and optimizer-specific tuning
-before drawing general conclusions about which optimizer is best.
-
-## Research limitations to state honestly
-
-- The main experiment is metadata manipulation detection; the separate pixel experiment does not train an image anomaly detector.
-- CPAISD is single-center and contains hyperacute ischemic stroke cases only.
-- For quick development, the selector accepts smaller `--train-studies`, `--validation-studies`, and `--test-studies` values. Such results are exploratory. Full-cohort results still need multi-center validation. Instance-level slice scores are correlated, so study-level metrics are also reported.
-- PixelData integrity hashing is outside the metadata-only training run and is evaluated separately by the pixel experiment above.
-- SHA-256 comparison assumes the baseline is trusted and protected independently.
-- Anomaly scores are not proof of malicious intent.
-- This is not a clinical diagnostic or deployment-ready system.
+Dataset: D. Umerenkov, S. Kudin, M. Peksheva, D. Pavlov, "Core-penumbra hyperacute ischemic stroke dataset," *Scientific Data*, vol. 12, 707, 2025, doi:10.1038/s41597-025-05000-0.

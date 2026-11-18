@@ -1,0 +1,8 @@
+method,accuracy,precision,recall,f1,false_positive_rate,true_negative,false_positive,false_negative,true_positive
+SHA-256 metadata integrity,1.0,1.0,1.0,1.0,0.0,0,0,0,36
+Structural rules,0.0,0.0,0.0,0.0,0.0,0,0,36,0
+Isolation Forest,0.0,0.0,0.0,0.0,0.0,0,0,36,0
+Autoencoder,1.0,1.0,1.0,1.0,0.0,0,0,0,36
+Isolation Forest + Autoencoder,1.0,1.0,1.0,1.0,0.0,0,0,0,36
+Rules + Isolation Forest,0.0,0.0,0.0,0.0,0.0,0,0,36,0
+Hybrid (SHA-256 + rules + IF + Autoencoder),1.0,1.0,1.0,1.0,0.0,0,0,0,36
