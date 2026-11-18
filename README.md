@@ -576,3 +576,74 @@ experiment_cpaisd_unet_fgsm_pgd/
 ```
 
 Dataset: D. Umerenkov, S. Kudin, M. Peksheva, D. Pavlov, "Core-penumbra hyperacute ischemic stroke dataset," *Scientific Data*, vol. 12, 707, 2025, doi:10.1038/s41597-025-05000-0.
+
+---
+
+## 21. Added clean-training baselines: kNN, PatchCore, and late fusion
+
+These are independent extensions to the existing pipeline. They do not replace
+the Isolation Forest, metadata autoencoder, no-reference pixel baselines, or
+U-Net experiments. Do not report results until the scripts have been run and
+their output files reviewed.
+
+### Metadata kNN
+
+`src/knn_anomaly.py` uses the existing metadata feature extractor and scores an
+instance by its mean distance to the `k` nearest clean training instances.
+Larger scores indicate greater anomaly. The threshold is calibrated from clean
+validation scores. Outputs include file- and study-level metrics by attack.
+
+```powershell
+python scripts/run_knn_metadata_experiment.py `
+  --train data/cpaisd/train --validation data/cpaisd/val --test data/cpaisd/test `
+  --attacks-root experiment_cpaisd_combined_independent/combined_attacks `
+  --labels-csv experiment_cpaisd_combined_independent/combined_predictions.csv `
+  --output experiment_cpaisd_knn_metadata
+```
+
+### PatchCore-style pixel baseline
+
+`src/patchcore.py` uses fixed ResNet-18 layer2/layer3 features, a clean-training
+patch memory bank, and nearest-neighbor distances for image and spatial anomaly
+scores. To bound memory, this implementation uses deterministic random patch
+subsampling; it does not implement the original k-center coreset selection. By
+default, it transfers ImageNet weights to grayscale CT by repeating the image
+across three channels and applying ImageNet normalization. This transfer
+assumption must be reported and evaluated. `torchvision` is required for this
+optional experiment; install a build matching the PyTorch version and CPU/CUDA
+setup on the machine:
+
+```powershell
+python -c "import torch; print(torch.__version__)"
+# Install the matching torchvision wheel from the official PyTorch selector.
+python scripts/run_patchcore_experiment.py `
+  --train data/cpaisd/train --validation data/cpaisd/val --test data/cpaisd/test `
+  --attacks-root experiment_cpaisd_combined_independent/combined_attacks `
+  --labels-csv experiment_cpaisd_combined_independent/combined_predictions.csv `
+  --output experiment_cpaisd_patchcore
+```
+
+The `--weights none` option is for pipeline debugging only: it uses randomly
+initialized frozen features and is not the ImageNet PatchCore baseline.
+Training and inference may be slow on CPU.
+
+### Late fusion
+
+`scripts/run_late_fusion.py` joins branch predictions by attack and relative
+file path, and errors if files or labels do not match. It reports each branch,
+equal-weight score fusion, and OR/AND decision fusion. The score weights are
+fixed; score scaling and the score-fusion cutoff use clean validation scores
+only. Pass the existing `combined_predictions.csv` to both branch runners so
+metadata, pixel, and union labels stay separate. Run both branches against
+the same paired attack folder:
+
+```powershell
+python scripts/run_late_fusion.py `
+  --metadata-results experiment_cpaisd_knn_metadata `
+  --patchcore-results experiment_cpaisd_patchcore `
+  --output experiment_cpaisd_late_fusion
+```
+
+These extensions use the same ten-study test fold. Report study-level results
+alongside file-level metrics, preserve the clean originals, and describe alarms
+as anomaly signals rather than remediation or proof of malicious intent.
