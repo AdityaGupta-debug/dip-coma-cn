@@ -47,7 +47,8 @@ def _matrix(paths, vectorizer=None, scaler=None, fit=False):
 def train_autoencoder(clean_dir, model_path, validation_dir=None,
                       epochs=100, batch_size=32, learning_rate=1e-3,
                       threshold_percentile=99.0, random_state=42,
-                      max_train_files=30000, max_validation_files=10000):
+                      max_train_files=30000, max_validation_files=10000,
+                      optimizer_name="adam", momentum=0.9, weight_decay=1e-4):
     torch.manual_seed(random_state)
     paths = find_dicom_files(clean_dir)
     if len(paths) < 10:
@@ -67,7 +68,20 @@ def train_autoencoder(clean_dir, model_path, validation_dir=None,
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MetadataAutoencoder(X.shape[1]).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer_name = str(optimizer_name).lower().replace(" ", "_")
+    optimizer_options = {
+        "adam": lambda: torch.optim.Adam(model.parameters(), lr=learning_rate),
+        "rmsprop": lambda: torch.optim.RMSprop(model.parameters(), lr=learning_rate),
+        "adamw": lambda: torch.optim.AdamW(
+            model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        ),
+        "sgd_momentum": lambda: torch.optim.SGD(
+            model.parameters(), lr=learning_rate, momentum=momentum
+        ),
+    }
+    if optimizer_name not in optimizer_options:
+        raise ValueError(f"Unsupported optimizer {optimizer_name!r}; choose from {', '.join(optimizer_options)}")
+    optimizer = optimizer_options[optimizer_name]()
     loss_fn = nn.MSELoss()
     tensor = torch.from_numpy(X)
     loader = DataLoader(TensorDataset(tensor), batch_size=max(1, min(batch_size, len(X))), shuffle=True)
@@ -95,7 +109,9 @@ def train_autoencoder(clean_dir, model_path, validation_dir=None,
         "threshold": threshold, "threshold_percentile": float(threshold_percentile),
         "training_files": len(paths), "validation_files": 0 if X_val is None else len(X_val),
         "threshold_source": "clean_validation" if X_val is not None else "clean_training_fallback",
-        "epochs": int(epochs)
+        "epochs": int(epochs), "optimizer": optimizer_name,
+        "learning_rate": float(learning_rate), "momentum": float(momentum),
+        "weight_decay": float(weight_decay), "random_state": int(random_state),
     }
     Path(model_path).parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, model_path)

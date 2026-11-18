@@ -6,6 +6,7 @@ import pandas as pd
 from .dicom_io import find_dicom_files, read_dataset, relative_key
 from .integrity import load_baseline, metadata_sha256, pixel_sha256
 from .validation import validate_datasets
+from .semantic_consistency import validate_semantic_consistency
 from .anomaly import load_model, predict_anomalies
 from .deep_anomaly import predict_autoencoder_with_explanations
 
@@ -15,6 +16,7 @@ def detect_directory(input_dir, baseline_path, model_path, output_csv=None, auto
     paths = find_dicom_files(root)
     datasets = [(relative_key(p, root), read_dataset(p, stop_before_pixels=True)) for p in paths]
     rules = validate_datasets(datasets)
+    semantic = validate_semantic_consistency(datasets)
     model_bundle = load_model(model_path)
     if_results = predict_anomalies(datasets, model_bundle)
     ae_results = (predict_autoencoder_with_explanations(datasets, autoencoder_model_path)
@@ -47,6 +49,8 @@ def detect_directory(input_dir, baseline_path, model_path, output_csv=None, auto
             pixel_mismatch = int(ref is None or pixel_sha256(full_ds) != ref.get("pixel_sha256"))
             del full_ds
         rule_flag = int(bool(rules[rel_path]))
+        semantic_findings = semantic[rel_path]
+        semantic_flag = int(bool(semantic_findings))
         if_flag, if_score = if_results[rel_path]
         ae_flag, ae_error, ae_top_features = ae_results[rel_path]
         alert_sources, explanations = [], []
@@ -59,6 +63,9 @@ def detect_directory(input_dir, baseline_path, model_path, output_csv=None, auto
         if rule_flag:
             alert_sources.append("structural_rules")
             explanations.append("structural findings: " + ", ".join(rules[rel_path]))
+        if semantic_flag:
+            alert_sources.append("semantic_consistency")
+            explanations.append("within-study/series metadata conflicts: " + ", ".join(semantic_findings))
         if if_flag:
             alert_sources.append("isolation_forest")
             explanations.append(f"Isolation Forest score {if_score:.6g} is below clean-validation threshold {model_bundle.get('threshold', 0.0):.6g}")
@@ -74,6 +81,8 @@ def detect_directory(input_dir, baseline_path, model_path, output_csv=None, auto
             "file": rel_path, "sha256_flag": meta_mismatch,
             "pixel_integrity_flag": pixel_mismatch, "rule_flag": rule_flag,
             "rule_findings": ";".join(rules[rel_path]),
+            "semantic_flag": semantic_flag,
+            "semantic_findings": ";".join(semantic_findings),
             "isolation_forest_flag": if_flag, "isolation_forest_score": if_score,
             "isolation_forest_threshold": float(model_bundle.get("threshold", 0.0)),
             "autoencoder_flag": ae_flag, "autoencoder_reconstruction_error": ae_error,
@@ -83,6 +92,7 @@ def detect_directory(input_dir, baseline_path, model_path, output_csv=None, auto
             "alert_explanation": " | ".join(explanations),
             "if_ae_flag": int(bool(if_flag or ae_flag)),
             "hybrid_or_flag": int(bool(meta_mismatch or rule_flag or if_flag or ae_flag)),
+            "semantic_hybrid_or_flag": int(bool(meta_mismatch or rule_flag or semantic_flag or if_flag or ae_flag)),
             "rules_if_flag": int(bool(rule_flag or if_flag)),
         })
     frame = pd.DataFrame(rows)

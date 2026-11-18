@@ -30,6 +30,7 @@ from src.no_reference_pixel import (
 )
 from src.pixel_integrity import _edit_pixels
 from src.pixel_metadata_consistency import check_pixel_metadata_consistency
+from src.semantic_consistency import validate_semantic_consistency
 
 
 DATASET_DIR = PROJECT_ROOT / "data" / "cpaisd" / "test"
@@ -55,6 +56,19 @@ st.set_page_config(page_title="DICOM Security Demo Lab", page_icon="🧠", layou
 @st.cache_data(show_spinner="Loading the preloaded CPAISD test fold...")
 def get_dicom_paths(root_string: str) -> tuple[str, ...]:
     return tuple(str(path) for path in find_dicom_files(root_string))
+
+
+@st.cache_resource(show_spinner="Indexing study/series metadata for consistency checks...")
+def get_semantic_study_index(root_string: str):
+    grouped = {}
+    root = Path(root_string)
+    for path_string in get_dicom_paths(root_string):
+        path = Path(path_string)
+        dataset = read_dataset(path, stop_before_pixels=True)
+        study_uid = str(getattr(dataset, "StudyInstanceUID", "")).strip()
+        if study_uid:
+            grouped.setdefault(study_uid, []).append((relative_key(path, root), dataset))
+    return grouped
 
 
 @st.cache_resource(show_spinner=False)
@@ -172,7 +186,8 @@ def apply_metadata_edit(dataset, edit_name: str) -> tuple[str, str, str]:
 
 def detector_rows(clean_row, edited_row, pixel_hash_changed: bool,
                   clean_pixel_flag: int, edited_pixel_flag: int,
-                  pixel_model_rows: list[dict], clean_layout: list[str], edited_layout: list[str]):
+                  pixel_model_rows: list[dict], clean_layout: list[str], edited_layout: list[str],
+                  clean_semantic: list[str], edited_semantic: list[str]):
     rows = []
 
     def add(name, clean_alert, edited_alert, detail):
@@ -190,6 +205,9 @@ def detector_rows(clean_row, edited_row, pixel_hash_changed: bool,
         "Did the stored pixel payload change from the clean reference?")
     add("Structural rules", int(clean_row.rule_flag), int(edited_row.rule_flag),
         str(edited_row.rule_findings) or "Required fields and basic CT constraints")
+    add("Semantic study/series consistency", int(bool(clean_semantic)), int(bool(edited_semantic)),
+        "; ".join(edited_semantic) if edited_semantic else
+        "Do patient/study fields and stable acquisition fields agree across peer slices?")
     add("Isolation Forest", int(clean_row.isolation_forest_flag), int(edited_row.isolation_forest_flag),
         f"Score {edited_row.isolation_forest_score:.5f}; threshold {edited_row.isolation_forest_threshold:.5f}")
     add("Metadata autoencoder", int(clean_row.autoencoder_flag), int(edited_row.autoencoder_flag),
@@ -199,9 +217,11 @@ def detector_rows(clean_row, edited_row, pixel_hash_changed: bool,
     add("Pixel/header consistency", int(bool(clean_layout)), int(bool(edited_layout)),
         "; ".join(edited_layout) if edited_layout else "Do pixel layout and header dimensions agree?")
     clean_or = int(bool(clean_row.sha256_flag or clean_pixel_flag or clean_row.rule_flag
+                         or clean_semantic
                          or clean_row.isolation_forest_flag or clean_row.autoencoder_flag
                          or any(x["clean_flag"] for x in pixel_model_rows) or clean_layout))
     edited_or = int(bool(edited_row.sha256_flag or pixel_hash_changed or edited_row.rule_flag
+                         or edited_semantic
                          or edited_row.isolation_forest_flag or edited_row.autoencoder_flag
                          or any(x["edited_flag"] for x in pixel_model_rows) or edited_layout))
     add("All-checks OR summary", clean_or, edited_or,
@@ -250,6 +270,14 @@ def run_live_demo(source_file: Path, edit_mode: str, metadata_edit: str | None,
         edited_detection = detect_directory(edited_root, baseline_path, IF_MODEL, autoencoder_model_path=AE_MODEL).iloc[0]
         clean_ds = read_dataset(clean_file, stop_before_pixels=False)
         edited_ds = read_dataset(edited_file, stop_before_pixels=False)
+        clean_study_uid = str(getattr(clean_ds, "StudyInstanceUID", "")).strip()
+        study_peers = get_semantic_study_index(str(DATASET_DIR)).get(clean_study_uid, [])
+        clean_semantic_items = [(key, peer) for key, peer in study_peers if key != relative]
+        clean_semantic_items.append((relative, clean_ds))
+        edited_semantic_items = [(key, peer) for key, peer in study_peers if key != relative]
+        edited_semantic_items.append((relative, edited_ds))
+        clean_semantic = validate_semantic_consistency(clean_semantic_items).get(relative, [])
+        edited_semantic = validate_semantic_consistency(edited_semantic_items).get(relative, [])
         clean_pixels = np.asarray(clean_ds.pixel_array)
         edited_pixels = np.asarray(edited_ds.pixel_array)
         difference = np.abs(edited_pixels.astype(np.float32) - clean_pixels.astype(np.float32))
@@ -326,7 +354,7 @@ def run_live_demo(source_file: Path, edit_mode: str, metadata_edit: str | None,
         rows = detector_rows(
             clean_detection, edited_detection, pixel_hash_changed,
             int(clean_detection.pixel_integrity_flag or 0), int(edited_detection.pixel_integrity_flag or 0),
-            no_reference_rows, clean_layout, edited_layout,
+            no_reference_rows, clean_layout, edited_layout, clean_semantic, edited_semantic,
         )
         clean_norm, clean_mask = image_masks[0]
         edited_norm, edited_mask = image_masks[1]
@@ -336,6 +364,7 @@ def run_live_demo(source_file: Path, edit_mode: str, metadata_edit: str | None,
             "difference": difference,
             "clean_pixels": clean_pixels,
             "edited_pixels": edited_pixels,
+            "synthetic_mask": synthetic_pixel_mask,
             "clean_norm": clean_norm,
             "edited_norm": edited_norm,
             "clean_mask": clean_mask,
@@ -347,6 +376,8 @@ def run_live_demo(source_file: Path, edit_mode: str, metadata_edit: str | None,
             "edited_metadata_hash": metadata_sha256(edited_ds),
             "clean_layout": clean_layout,
             "edited_layout": edited_layout,
+            "clean_semantic": clean_semantic,
+            "edited_semantic": edited_semantic,
             "unet": unet_outputs,
         }
 
@@ -358,6 +389,8 @@ def show_saved_results():
         ("Pixel integrity and masks", PROJECT_ROOT / "experiment_cpaisd_pixel_masks" / "pixel_metrics.csv"),
         ("No-reference pixel detector", PROJECT_ROOT / "experiment_cpaisd_no_reference_v2" / "no_reference_pixel_metrics.csv"),
         ("Header-to-pixel consistency", PROJECT_ROOT / "experiment_cpaisd_cross_layer" / "cross_layer_summary.csv"),
+        ("Semantic consistency study metrics", PROJECT_ROOT / "experiment_cpaisd_semantic_consistency" / "semantic_consistency_summary.csv"),
+        ("Semantic consistency per-study findings", PROJECT_ROOT / "experiment_cpaisd_semantic_consistency" / "semantic_consistency_per_study.csv"),
         ("Adaptive feature evasion", PROJECT_ROOT / "experiment_cpaisd_adaptive_evasion" / "adaptive_evasion_summary.csv"),
         ("Benign changes versus attacks", PROJECT_ROOT / "experiment_cpaisd_benign_attack_v3" / "benign_vs_attack_summary.csv"),
         ("Combined metadata + pixel checks", PROJECT_ROOT / "experiment_cpaisd_combined_independent" / "combined_metrics.csv"),
@@ -416,7 +449,7 @@ with st.sidebar:
     st.caption("Dataset: data/cpaisd/test")
     st.divider()
     st.metric("Studies in test fold", "10")
-    st.metric("Available checks", "10" if UNET_MODEL.is_file() else "9")
+    st.metric("Available checks", "11" if UNET_MODEL.is_file() else "10")
     if UNET_MODEL.is_file():
         st.caption(f"U-Net checkpoint: {UNET_MODEL.parent.relative_to(PROJECT_ROOT)}")
 
@@ -427,7 +460,7 @@ with overview_tab:
     st.write("Pick one preloaded CT slice, apply a controlled metadata edit, pixel edit, or both, and compare the clean and edited copies across the project's implemented integrity and anomaly checks.")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Preloaded CT slices", len(dicom_paths))
-    c2.metric("Metadata checks", "4")
+    c2.metric("Metadata checks", "5")
     c3.metric("Pixel checks", "5" if UNET_MODEL.is_file() else "4")
     c4.metric("Saved experiment groups", "8")
     preview_ds = read_dataset(dicom_paths[0], stop_before_pixels=False)
@@ -439,6 +472,7 @@ with overview_tab:
         - **Metadata SHA-256:** exact header change against the clean slice.
         - **PixelData SHA-256:** exact stored-pixel change against the clean slice.
         - **Structural rules:** basic metadata constraints, including CT modality.
+        - **Semantic consistency:** checks whether patient/study and stable series fields agree across peer slices.
         - **Isolation Forest and autoencoder:** metadata anomaly scores learned from clean training data.
         - **No-reference pixel Isolation Forest and median residual:** image-only anomaly baselines that do not compare against a clean image.
         - **Supervised U-Net pixel localizer:** trained on synthetic edit masks; shown when the trained checkpoint is present. Its output is a research baseline, not a clinical assessment.

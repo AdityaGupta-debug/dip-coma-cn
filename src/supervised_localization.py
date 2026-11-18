@@ -83,6 +83,84 @@ class UNetLocalizer(nn.Module):
         return self.output(d1)
 
 
+class AttentionGate(nn.Module):
+    """Gate encoder skip features using the corresponding decoder context."""
+    def __init__(self, skip_channels: int, gating_channels: int, inter_channels: int):
+        super().__init__()
+        self.skip_projection = nn.Sequential(
+            nn.Conv2d(skip_channels, inter_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_channels),
+        )
+        self.gating_projection = nn.Sequential(
+            nn.Conv2d(gating_channels, inter_channels, kernel_size=1, bias=True),
+            nn.BatchNorm2d(inter_channels),
+        )
+        self.attention = nn.Sequential(
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inter_channels, 1, kernel_size=1, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, skip, gating):
+        coefficients = self.attention(
+            self.skip_projection(skip) + self.gating_projection(gating)
+        )
+        coefficients = F.interpolate(coefficients, size=skip.shape[-2:],
+                                      mode="bilinear", align_corners=False)
+        return skip * coefficients
+
+
+class AttentionUNetLocalizer(nn.Module):
+    """U-Net variant that gates skip features with decoder attention."""
+    def __init__(self, base_channels: int = 8):
+        super().__init__()
+        b = base_channels
+        self.enc1 = ConvBlock(1, b)
+        self.enc2 = ConvBlock(b, b * 2)
+        self.enc3 = ConvBlock(b * 2, b * 4)
+        self.enc4 = ConvBlock(b * 4, b * 8)
+        self.bottleneck = ConvBlock(b * 8, b * 16)
+        self.pool = nn.MaxPool2d(2)
+        self.up4 = nn.ConvTranspose2d(b * 16, b * 8, 2, stride=2)
+        self.gate4 = AttentionGate(b * 8, b * 8, b * 4)
+        self.dec4 = ConvBlock(b * 16, b * 8)
+        self.up3 = nn.ConvTranspose2d(b * 8, b * 4, 2, stride=2)
+        self.gate3 = AttentionGate(b * 4, b * 4, b * 2)
+        self.dec3 = ConvBlock(b * 8, b * 4)
+        self.up2 = nn.ConvTranspose2d(b * 4, b * 2, 2, stride=2)
+        self.gate2 = AttentionGate(b * 2, b * 2, b)
+        self.dec2 = ConvBlock(b * 4, b * 2)
+        self.up1 = nn.ConvTranspose2d(b * 2, b, 2, stride=2)
+        self.gate1 = AttentionGate(b, b, max(1, b // 2))
+        self.dec1 = ConvBlock(b * 2, b)
+        self.output = nn.Conv2d(b, 1, 1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+        center = self.bottleneck(self.pool(e4))
+        d4 = self.up4(center)
+        d4 = self.dec4(torch.cat([d4, self.gate4(e4, d4)], dim=1))
+        d3 = self.up3(d4)
+        d3 = self.dec3(torch.cat([d3, self.gate3(e3, d3)], dim=1))
+        d2 = self.up2(d3)
+        d2 = self.dec2(torch.cat([d2, self.gate2(e2, d2)], dim=1))
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, self.gate1(e1, d1)], dim=1))
+        return self.output(d1)
+
+
+def build_localizer(architecture: str = "unet", base_channels: int = 8):
+    if architecture == "unet":
+        return UNetLocalizer(base_channels=base_channels)
+    if architecture == "attention_unet":
+        return AttentionUNetLocalizer(base_channels=base_channels)
+    raise ValueError("architecture must be 'unet' or 'attention_unet'.")
+
+
 def _study_group(ds, path: Path) -> str:
     identity = str(getattr(ds, "StudyInstanceUID", "")).strip() or str(path.parent.parent)
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
@@ -333,7 +411,7 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
                                 max_validation_attack_files=256, max_test_files=0,
                                 attack_fraction=0.20,
                                 pixel_quantile=99.5, image_quantile=99.0,
-                                base_channels=8, device_name="auto"):
+                                base_channels=8, device_name="auto", architecture="unet"):
     start_time = time.perf_counter()
     output = Path(output_dir).resolve()
     if output.exists() and any(output.iterdir()):
@@ -374,7 +452,7 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
     train_dataset = SyntheticTrainingDataset(train_paths, image_size, seed)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                               num_workers=0, pin_memory=device.type == "cuda")
-    model = UNetLocalizer(base_channels=base_channels).to(device)
+    model = build_localizer(architecture=architecture, base_channels=base_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     validation_attack_records = validation_images
     if max_validation_attack_files and len(validation_attack_records) > max_validation_attack_files:
@@ -562,12 +640,14 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
     checkpoint = {
         "state_dict": model.cpu().state_dict(),
         "config": {"image_size": image_size, "base_channels": base_channels,
+                   "architecture": architecture,
                    "pixel_threshold": pixel_threshold, "image_threshold": image_threshold,
                    "pixel_quantile": pixel_quantile, "image_quantile": image_quantile,
                    "seed": seed, "train_families": list(TRAIN_FAMILIES),
                    "withheld_test_family": "copy_move_unseen"},
     }
-    torch.save(checkpoint, output / "unet_localizer.pt")
+    checkpoint_name = "attention_unet_localizer.pt" if architecture == "attention_unet" else "unet_localizer.pt"
+    torch.save(checkpoint, output / checkpoint_name)
     config = {
         "dataset": "CPAISD", "train_images_used": len(train_paths),
         "validation_images_used": len(validation_images), "test_images_used": len(test_images),
@@ -581,6 +661,7 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         "validation_attack_images": len(validation_attack_records),
         "validation_metric_threshold": 0.5,
         "batch_size": batch_size, "base_channels": base_channels,
+        "architecture": architecture,
         "device": str(device), "seed": seed, "pixel_threshold": pixel_threshold,
         "image_threshold": image_threshold, "pixel_threshold_clean_quantile": pixel_quantile,
         "image_threshold_clean_quantile": image_quantile,
@@ -598,13 +679,14 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
     (output / "experiment_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     report = [
         "# Supervised DICOM pixel-tamper localization", "",
-        "A compact U-Net is trained to segment synthetic pixel edits. The model receives each image independently; it does not receive a clean counterpart or a hash reference at inference time.",
+        f"The {architecture} model is trained to segment synthetic pixel edits. The model receives each image independently; it does not receive a clean counterpart or a hash reference at inference time.",
         "Training edit families are localized patches and sparse low-amplitude changes. The copy-move family is withheld from training and evaluated as a synthetic out-of-family condition.",
         "Thresholds are calibrated using clean validation images only. Pixel masks are resized to the model grid before evaluation; they are not native-resolution clinical annotations.", "",
         f"- Train images: {len(train_paths)} (cap={max_train_files or 'all'})",
         f"- Validation images: {len(validation_images)}",
         f"- Test images: {len(test_images)} across {len(study_ids)} studies",
         f"- Device: {device}; epochs completed: {len(history)}; input: {image_size}x{image_size}",
+        f"- Architecture: {architecture}; base channels: {base_channels}",
         f"- Best epoch selected by validation macro pixel IoU: {best_epoch} ({best_validation_iou:.4f})",
         f"- Synthetic-mask validation images: {len(validation_attack_records)}; selection threshold: 0.5",
         f"- Clean-test image FPR at calibrated threshold: {clean_image_fpr:.4f}",

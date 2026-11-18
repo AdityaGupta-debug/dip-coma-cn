@@ -224,7 +224,8 @@ tables from prior runs.
 
 These extensions have already been run in this workspace; their result folders
 are `experiment_cpaisd_cross_layer`, `experiment_cpaisd_adaptive_evasion`,
-`experiment_cpaisd_benign_vs_attack`, and `experiment_cpaisd_study_calibration`.
+`experiment_cpaisd_benign_vs_attack`, `experiment_cpaisd_study_calibration`,
+and `experiment_cpaisd_semantic_consistency`.
 The commands below are for reproduction. Each script requires an empty output
 folder, so use a different `--output` name when rerunning.
 
@@ -299,6 +300,24 @@ privacy-field cleanup is a limited synthetic proxy, not a complete
 standards-conformant de-identification process. Use a fresh `--output` folder
 for every run.
 
+### Study/series metadata consistency
+
+This checks whether selected values agree among slices in one study or series
+(for example, PatientID, ProtocolName, Manufacturer, image layout, and related
+pixel-representation fields). The experiment changes one instance in two
+studies and reports at the study level because a group conflict can implicate
+peer slices. It does not prove intent, and a coordinated edit applied
+consistently to an entire group may evade the check:
+
+```cmd
+uv run python scripts/run_semantic_metadata_experiment.py --input data/cpaisd/test --output experiment_cpaisd_semantic_consistency_rerun --attack-fraction 0.20 --seed 42
+```
+
+The saved run detected both affected studies for four single-slice conditions
+missed by basic structural rules, with no false alarms among the eight
+unaffected studies per condition. The test fold has only ten studies, so treat
+these results as exploratory.
+
 ### Calibrate alerts at study level
 
 This uses the validation fold to calibrate study-level Isolation Forest and
@@ -371,6 +390,22 @@ This control changes `ImplementationVersionName` to a synthetic receiver
 identifier while keeping the clinical dataset attributes and PixelData fixed.
 It measures strict-hash sensitivity to a benign-like header update; it is not a
 simulation of a named PACS product. Use a fresh output path for each run.
+
+## Autoencoder optimizer comparison
+
+To compare the existing Adam optimizer with RMSprop, AdamW, and SGD with
+momentum on the same CPAISD folds and six metadata attacks, run:
+
+```cmd
+uv run python -m scripts.run_autoencoder_optimizer_comparison --train data/cpaisd/train --validation data/cpaisd/val --test data/cpaisd/test --attacks experiment_cpaisd/attacks --output experiment_cpaisd/reports/autoencoder_optimizer_comparison --epochs 40 --batch-size 32 --learning-rate 0.001 --threshold-percentile 99 --seed 42
+```
+
+The script fits each model on clean training metadata, calibrates its threshold
+on clean validation data, and writes `optimizer_summary.csv`,
+`per_attack_metrics.csv`, a run configuration, and the model files. Each output
+directory must be new or empty. The comparison uses one seed and common
+hyperparameters; repeat it with other seeds and optimizer-specific tuning
+before drawing general conclusions about which optimizer is best.
 
 ## Research limitations to state honestly
 

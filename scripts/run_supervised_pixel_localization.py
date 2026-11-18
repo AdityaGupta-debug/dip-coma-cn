@@ -37,6 +37,8 @@ def main():
     parser.add_argument("--image-quantile", type=float, default=99.0,
                         help="Clean-validation per-image maximum-score quantile")
     parser.add_argument("--base-channels", type=int, default=8)
+    parser.add_argument("--architecture", choices=["unet", "attention_unet"], default="unet",
+                        help="Model architecture; use attention_unet for attention-gated skip connections")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or another torch device")
     args = parser.parse_args()
 
@@ -49,7 +51,7 @@ def main():
         max_test_files=args.max_test_files,
         attack_fraction=args.attack_fraction, pixel_quantile=args.pixel_quantile,
         image_quantile=args.image_quantile, base_channels=args.base_channels,
-        device_name=args.device,
+        device_name=args.device, architecture=args.architecture,
     )
     print(summary.to_string(index=False))
     print(f"\nSaved: {Path(args.output).resolve()}")
