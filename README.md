@@ -181,6 +181,24 @@ A conflict = values disagree, or a tag exists in some members and not others. Gr
 
 Optimizer ablation: Adam (baseline), RMSprop, AdamW (wd 1e-4), SGD (momentum 0.9). Everything else held fixed, one seed, no per-optimizer tuning.
 
+### 6.5.1 Denoising-autoencoder comparison (implementation added; not run)
+
+The optional matched comparison trains the same MLP with clean targets while
+adding Gaussian noise (`std=0.10`) and random feature masking (`p=0.05`) to
+training inputs. It compares the standard AE and denoising AE using RMSprop,
+the same folds and attack folders, and independent clean-validation thresholds.
+It reports attack macro metrics, clean file/study false-positive rates, and
+training curves. These defaults are exploratory and have not been evaluated.
+
+```powershell
+python scripts/run_denoising_autoencoder_comparison.py `
+  --train data/real_ct/train `
+  --validation data/real_ct/val `
+  --test data/real_ct/test `
+  --attacks experiment_cpaisd/attacks `
+  --output experiment_cpaisd/reports/denoising_autoencoder_comparison
+```
+
 ### 6.6 Feature representation (important for the results)
 
 - Numeric: rows, columns, bit depth, slice thickness, spacing, rescale params, KVP, tube current

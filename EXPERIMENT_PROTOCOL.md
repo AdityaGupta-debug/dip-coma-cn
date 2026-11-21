@@ -80,3 +80,29 @@ included in the manuscript until runs complete and per-attack outputs are
 inspected.
 
 The pixel experiment also stores packed synthetic edit masks and reports overlap between those masks and the nonzero clean-reference difference map. This is a mask/difference alignment check, not learned localization performance. `--severity-sweep` evaluates prespecified subtle/default/stronger edit settings. `scripts/run_combined_integrity_experiment.py` pairs selected metadata and pixel edits and reports the two reference checks separately and as an OR comparator. Do not describe these known-original hash results as no-reference detection or as a learned multimodal detector. Results from these extensions should be included in the manuscript only after those runs have been executed and their CSV outputs reviewed.
+
+## Metadata denoising-autoencoder comparison
+
+The denoising-autoencoder comparison is implemented in
+`src/denoising_anomaly.py` and `scripts/run_denoising_autoencoder_comparison.py`.
+It compares the standard MSE autoencoder with a matched MLP denoising
+autoencoder. The latter receives Gaussian noise and random feature masking in
+standardized feature space while reconstructing the clean input. Both models
+use RMSprop and the same clean folds and attack folders; each alarm threshold
+is calibrated independently on clean validation reconstruction errors. Both
+models are scored on clean inputs with MSE. Default corruption parameters are
+Gaussian standard deviation 0.10 and feature-mask probability 0.05; treat these
+as exploratory settings, not tuned values.
+
+```powershell
+python scripts/run_denoising_autoencoder_comparison.py `
+  --train data/real_ct/train `
+  --validation data/real_ct/val `
+  --test data/real_ct/test `
+  --attacks experiment_cpaisd/attacks `
+  --output experiment_cpaisd/reports/denoising_autoencoder_comparison
+```
+
+The output includes matched summary and per-attack metrics, training curves,
+configuration, and model bundles. Do not include findings in the paper until
+the run is completed and the saved metrics are reviewed.
