@@ -44,11 +44,37 @@ def _matrix(paths, vectorizer=None, scaler=None, fit=False):
     X = scaler.fit_transform(X) if fit else scaler.transform(X)
     return X.astype(np.float32), vectorizer, scaler
 
+
+def _reconstruction_loss_elements(target, reconstructed, loss_name="mse"):
+    """Return one reconstruction-loss value per feature.
+
+    Inputs have already been standardized. Robust alternatives reduce the
+    influence of unusually large residuals while retaining a per-feature
+    score for anomaly ranking and explanations.
+    """
+    residual = reconstructed - target
+    loss_name = str(loss_name).lower().replace("-", "_")
+    if loss_name == "mse":
+        return residual.square()
+    if loss_name == "mae":
+        return residual.abs()
+    if loss_name in {"smooth_l1", "huber"}:
+        return torch.nn.functional.smooth_l1_loss(
+            reconstructed, target, reduction="none", beta=1.0
+        )
+    if loss_name == "log_cosh":
+        return torch.logaddexp(residual, -residual) - np.log(2.0)
+    raise ValueError(
+        f"Unsupported reconstruction loss {loss_name!r}; choose from "
+        "mse, mae, smooth_l1, log_cosh"
+    )
+
 def train_autoencoder(clean_dir, model_path, validation_dir=None,
                       epochs=100, batch_size=32, learning_rate=1e-3,
                       threshold_percentile=99.0, random_state=42,
                       max_train_files=30000, max_validation_files=10000,
-                      optimizer_name="adam", momentum=0.9, weight_decay=1e-4):
+                      optimizer_name="adam", momentum=0.9, weight_decay=1e-4,
+                      reconstruction_loss="mse", validation_paths=None):
     torch.manual_seed(random_state)
     paths = find_dicom_files(clean_dir)
     if len(paths) < 10:
@@ -57,7 +83,8 @@ def train_autoencoder(clean_dir, model_path, validation_dir=None,
         paths = random.Random(random_state).sample(paths, max_train_files)
     X, vectorizer, scaler = _matrix(paths, fit=True)
     if validation_dir:
-        val_paths = find_dicom_files(validation_dir)
+        val_paths = (list(validation_paths) if validation_paths is not None
+                     else find_dicom_files(validation_dir))
         if len(val_paths) < 1:
             raise ValueError("Validation directory contains no readable DICOM files.")
         if max_validation_files and len(val_paths) > max_validation_files:
@@ -82,24 +109,48 @@ def train_autoencoder(clean_dir, model_path, validation_dir=None,
     if optimizer_name not in optimizer_options:
         raise ValueError(f"Unsupported optimizer {optimizer_name!r}; choose from {', '.join(optimizer_options)}")
     optimizer = optimizer_options[optimizer_name]()
-    loss_fn = nn.MSELoss()
+    reconstruction_loss = str(reconstruction_loss).lower().replace("-", "_")
+    # Validate the requested name before spending time training.
+    _reconstruction_loss_elements(torch.zeros(1), torch.zeros(1), reconstruction_loss)
     tensor = torch.from_numpy(X)
     loader = DataLoader(TensorDataset(tensor), batch_size=max(1, min(batch_size, len(X))), shuffle=True)
+
+    def matrix_loss(matrix):
+        model.eval()
+        values = []
+        with torch.no_grad():
+            for start in range(0, len(matrix), 1024):
+                batch = torch.from_numpy(matrix[start:start + 1024]).to(device)
+                values.append(_reconstruction_loss_elements(
+                    batch, model(batch), reconstruction_loss
+                ).mean(dim=1).cpu().numpy())
+        return float(np.concatenate(values).mean())
+
+    loss_history = {"train": [], "validation": []}
     model.train()
     for _ in range(epochs):
         for (batch,) in loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            loss = loss_fn(model(batch), batch)
+            loss = _reconstruction_loss_elements(
+                batch, model(batch), reconstruction_loss
+            ).mean()
             loss.backward()
             optimizer.step()
+        loss_history["train"].append(matrix_loss(X))
+        loss_history["validation"].append(
+            matrix_loss(X_val) if X_val is not None else None
+        )
+        model.train()
 
     def errors(matrix):
         model.eval()
         with torch.no_grad():
             x = torch.from_numpy(matrix).to(device)
             reconstructed = model(x)
-            return torch.mean((x - reconstructed) ** 2, dim=1).cpu().numpy()
+            return _reconstruction_loss_elements(
+                x, reconstructed, reconstruction_loss
+            ).mean(dim=1).cpu().numpy()
 
     calibration = errors(X_val if X_val is not None else X)
     threshold = float(np.percentile(calibration, threshold_percentile))
@@ -110,6 +161,8 @@ def train_autoencoder(clean_dir, model_path, validation_dir=None,
         "training_files": len(paths), "validation_files": 0 if X_val is None else len(X_val),
         "threshold_source": "clean_validation" if X_val is not None else "clean_training_fallback",
         "epochs": int(epochs), "optimizer": optimizer_name,
+        "reconstruction_loss": reconstruction_loss,
+        "loss_history": loss_history,
         "learning_rate": float(learning_rate), "momentum": float(momentum),
         "weight_decay": float(weight_decay), "random_state": int(random_state),
     }
@@ -128,16 +181,21 @@ def predict_autoencoder_with_explanations(datasets, model_path, top_n=5):
     with torch.no_grad():
         x = torch.from_numpy(X)
         reconstructed = model(x)
-        squared_errors = (x - reconstructed) ** 2
-        errors = torch.mean(squared_errors, dim=1).numpy()
-        contributions = squared_errors.numpy()
+        contributions = _reconstruction_loss_elements(
+            x, reconstructed, bundle.get("reconstruction_loss", "mse")
+        )
+        errors = torch.mean(contributions, dim=1).numpy()
+        contributions = contributions.numpy()
     threshold = bundle["threshold"]
     feature_names = bundle["vectorizer"].get_feature_names_out()
     result = {}
     for i, (key, _) in enumerate(datasets):
         order = np.argsort(contributions[i])[::-1][:max(1, top_n)]
+        contribution_key = ("squared_reconstruction_error"
+                            if bundle.get("reconstruction_loss", "mse") == "mse"
+                            else "reconstruction_loss_contribution")
         top = [{"feature": str(feature_names[j]),
-                "squared_reconstruction_error": float(contributions[i, j])}
+                contribution_key: float(contributions[i, j])}
                for j in order]
         result[key] = (int(errors[i] > threshold), float(errors[i]), top)
     return result

@@ -96,9 +96,9 @@ as exploratory settings, not tuned values.
 
 ```powershell
 python scripts/run_denoising_autoencoder_comparison.py `
-  --train data/real_ct/train `
-  --validation data/real_ct/val `
-  --test data/real_ct/test `
+  --train data/cpaisd/train `
+  --validation data/cpaisd/val `
+  --test data/cpaisd/test `
   --attacks experiment_cpaisd/attacks `
   --output experiment_cpaisd/reports/denoising_autoencoder_comparison
 ```
@@ -106,3 +106,61 @@ python scripts/run_denoising_autoencoder_comparison.py `
 The output includes matched summary and per-attack metrics, training curves,
 configuration, and model bundles. Do not include findings in the paper until
 the run is completed and the saved metrics are reviewed.
+
+## Mixed-type metadata reconstruction loss
+
+The optional type-aware loss experiment is implemented in `src/mixed_anomaly.py`
+and `scripts/run_mixed_autoencoder_comparison.py`. It compares the standard
+MSE autoencoder with the same MLP trained using an equal-weight mean of
+numeric Smooth L1 (Huber, beta 1), categorical cross-entropy over
+DictVectorizer one-hot groups, and binary cross-entropy with logits for
+presence indicators. The encoder input remains the standardized feature
+matrix; binary and categorical targets remain raw 0/1 values for the relevant
+losses. Each model gets its own threshold calibrated on clean validation
+scores, and both use the same official folds and six existing attack folders.
+Unknown categories outside the training vectorizer vocabulary remain a
+limitation and are not represented as a dedicated unknown class.
+
+```powershell
+python scripts/run_mixed_autoencoder_comparison.py `
+  --train data/cpaisd/train `
+  --validation data/cpaisd/val `
+  --test data/cpaisd/test `
+  --attacks experiment_cpaisd/attacks `
+  --output experiment_cpaisd/reports/mixed_autoencoder_comparison
+```
+
+The fixed-weight comparison has been run once on the official folds. Its
+summary, per-attack metrics, and training curves are in
+`experiment_cpaisd/reports/mixed_autoencoder_comparison`; these local outputs
+should be reviewed before adding results to the paper.
+
+## Bilevel learned weights for the mixed metadata loss
+
+`src/mixed_anomaly.py` and `scripts/run_bilevel_mixed_autoencoder_comparison.py`
+also provide a bilevel variant. Numeric, categorical, and binary weights start
+equal and are parameterized by softmax, so they are learned during training
+and sum to one; no fixed one-third weights are imposed after initialization.
+The mixed AE parameters use RMSprop to match the MSE baseline. Adam updates the
+three loss-weight logits using a one-step unrolled hypergradient once per
+epoch. The outer objective is a pairwise softplus ranking loss that encourages
+synthetic validation-attack scores to exceed their clean counterparts.
+
+Validation studies are split by study identity: one half creates in-memory
+synthetic edits for weight updates, while the disjoint clean half calibrates
+thresholds for MSE, fixed mixed, and bilevel mixed models. The six existing
+test attack folders are used only for final evaluation. This adapts weights to
+the scripted validation attack families and is not evidence of adaptation to
+unknown real-world attacks. The bilevel run was completed once; its matched
+metrics and learned-weight trajectory are in
+`experiment_cpaisd/reports/bilevel_mixed_autoencoder_comparison`. These
+single-seed results are not yet included in the paper.
+
+```powershell
+python scripts/run_bilevel_mixed_autoencoder_comparison.py `
+  --train data/cpaisd/train `
+  --validation data/cpaisd/val `
+  --test data/cpaisd/test `
+  --attacks experiment_cpaisd/attacks `
+  --output experiment_cpaisd/reports/bilevel_mixed_autoencoder_comparison
+```

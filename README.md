@@ -181,22 +181,62 @@ A conflict = values disagree, or a tag exists in some members and not others. Gr
 
 Optimizer ablation: Adam (baseline), RMSprop, AdamW (wd 1e-4), SGD (momentum 0.9). Everything else held fixed, one seed, no per-optimizer tuning.
 
-### 6.5.1 Denoising-autoencoder comparison (implementation added; not run)
+### 6.5.1 Denoising-autoencoder comparison (run complete; exploratory)
 
 The optional matched comparison trains the same MLP with clean targets while
 adding Gaussian noise (`std=0.10`) and random feature masking (`p=0.05`) to
 training inputs. It compares the standard AE and denoising AE using RMSprop,
 the same folds and attack folders, and independent clean-validation thresholds.
 It reports attack macro metrics, clean file/study false-positive rates, and
-training curves. These defaults are exploratory and have not been evaluated.
+training curves. This comparison has been run once; outputs are in
+`experiment_cpaisd/reports/denoising_autoencoder_comparison` and are not yet
+included in the paper.
 
 ```powershell
 python scripts/run_denoising_autoencoder_comparison.py `
-  --train data/real_ct/train `
-  --validation data/real_ct/val `
-  --test data/real_ct/test `
+  --train data/cpaisd/train `
+  --validation data/cpaisd/val `
+  --test data/cpaisd/test `
   --attacks experiment_cpaisd/attacks `
   --output experiment_cpaisd/reports/denoising_autoencoder_comparison
+```
+
+### 6.5.2 Mixed-type reconstruction loss (runs complete; exploratory)
+
+This separate comparison keeps the MSE autoencoder as a baseline and tests an
+equal-weight mixed objective: Smooth L1 for numeric features, categorical
+cross-entropy for one-hot groups, and binary cross-entropy for field-presence
+indicators. It uses the same folds and existing attack conditions and
+calibrates each model on clean validation data.
+The fixed-weight and Adam-bilevel comparisons have each been run once. Their
+metrics and learned-weight curves are in the corresponding
+`experiment_cpaisd/reports/` folders; the results are not yet included in the
+paper.
+
+```powershell
+python scripts/run_mixed_autoencoder_comparison.py `
+  --train data/cpaisd/train `
+  --validation data/cpaisd/val `
+  --test data/cpaisd/test `
+  --attacks experiment_cpaisd/attacks `
+  --output experiment_cpaisd/reports/mixed_autoencoder_comparison
+```
+
+For a learned mixed-loss weighting ablation, use
+`scripts/run_bilevel_mixed_autoencoder_comparison.py`. The three group weights
+start equal and are optimized by an Adam hypergradient update; the AE weights
+remain trained with RMSprop to match the MSE baseline. Validation studies are
+split so the synthetic edits used to learn weights do not overlap the clean
+studies used for threshold calibration. This trains and compares MSE, fixed
+mixed, and bilevel mixed models:
+
+```powershell
+python scripts/run_bilevel_mixed_autoencoder_comparison.py `
+  --train data/cpaisd/train `
+  --validation data/cpaisd/val `
+  --test data/cpaisd/test `
+  --attacks experiment_cpaisd/attacks `
+  --output experiment_cpaisd/reports/bilevel_mixed_autoencoder_comparison
 ```
 
 ### 6.6 Feature representation (important for the results)
