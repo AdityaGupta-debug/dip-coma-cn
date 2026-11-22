@@ -2,7 +2,7 @@
 
 > New cryptographic signing, HMAC, verification, privacy-copy, and security experiment documentation: [SECURITY_FRAMEWORK.md](SECURITY_FRAMEWORK.md).
 
-> Paper: *Reference-Based Integrity Checking and Metadata Anomaly Detection for DICOM Brain CT: A Controlled Study of Metadata and Pixel Tampering*
+> Paper: *Integrity Verification and Anomaly Detection for DICOM Brain CT: Controlled Tampering and Signed-Manifest Evaluation*
 > Authors: Aditya Upendra Gupta, Aaditya Awasthi, Nidal, Sudhawalli
 > Dataset: CPAISD (non-contrast brain CT, hyperacute ischemic stroke)
 
@@ -56,6 +56,8 @@
   - [18. Reproducibility](#18-reproducibility)
   - [19. Glossary](#19-glossary)
   - [20. Citation](#20-citation)
+  - [21. Added clean-training baselines: kNN, PatchCore, and late fusion](#21-added-clean-training-baselines-knn-patchcore-and-late-fusion)
+  - [22. Computer Networks extension: authenticated DICOM exchange](#22-computer-networks-extension-authenticated-dicom-exchange)
 
 ---
 
@@ -549,7 +551,7 @@ Four attacks repeated with study-selection seeds 42/43/44, with a 2,000-resample
 - Strict hashes alarm on benign metadata rewrites.
 
 **Not supported:**
-- Clinical utility, real-world tamper detection
+- Clinical utility, deployed sender attribution, or real-world tamper detection
 - Cross-site / external generalization
 - Robustness to broad adaptive attackers
 - That RMSprop is generally best, or that attention helps
@@ -573,7 +575,7 @@ Four attacks repeated with study-selection seeds 42/43/44, with a 2,000-resample
 12. Conformal calibration limited to 10 validation studies
 13. Layout attacks are obvious (Rows/Columns); plausible-but-consistent edits untested
 14. Explanations (AE feature contributions) are diagnostic, not causal; a hash can't say which tag changed
-15. No clinical, forensic, sender-authentication, or intent validation
+15. No clinical or forensic validation; sender authentication is demonstrated only in a local signed-manifest prototype, not a deployed workflow
 
 ---
 
@@ -629,7 +631,7 @@ experiment_cpaisd_unet_fgsm_pgd/
 
 ```bibtex
 @misc{gupta_dicom_integrity,
-  title  = {Reference-Based Integrity Checking and Metadata Anomaly Detection for DICOM Brain CT: A Controlled Study of Metadata and Pixel Tampering},
+  title  = {Integrity Verification and Anomaly Detection for DICOM Brain CT: Controlled Tampering and Signed-Manifest Evaluation},
   author = {Gupta, Aditya Upendra and Awasthi, Aaditya and Nidal and Sudhawalli},
   note   = {Manuscript}
 }
@@ -707,3 +709,130 @@ python scripts/run_late_fusion.py `
 These extensions use the same ten-study test fold. Report study-level results
 alongside file-level metrics, preserve the clean originals, and describe alarms
 as anomaly signals rather than remediation or proof of malicious intent.
+
+---
+
+## 22. Computer Networks extension: authenticated DICOM exchange
+
+### Motivation and networking concepts
+
+DICOM transfers carry both image pixels and metadata. A transfer can arrive with changed bytes, an altered header, or a replaced reference digest. A hash can show that content differs from a stored digest, but it cannot show who created that digest. This extension adds an authenticated reference: a sender signs a manifest, and a receiver verifies the signature and DICOM content before running the existing integrity and anomaly checks.
+
+The prototype connects the project to several Computer Networks security concepts:
+
+| Concept | Implementation in this project |
+|---|---|
+| Message integrity | SHA-256 digests cover selected DICOM content scopes. |
+| Sender-key authentication | Ed25519 signs the manifest; the receiver verifies it using a locally trusted public key. |
+| Trust establishment | The public key is registered out of band. A key received alongside a file is not trusted automatically. |
+| Shared-secret authentication | Optional HMAC-SHA256 verifies a tag from a shared-key holder, but cannot identify which holder created it. |
+| Freshness and replay handling | A local cache flags manifest identifiers that have already been accepted. |
+| Confidentiality | Network confidentiality is not implemented. AES-GCM is provided only as an at-rest file wrapper. |
+| Auditability | JSONL audit events record operation outcomes and digests without raw patient identifiers. |
+| Anomaly detection | Existing rules and saved AI models run after cryptographic verification; their alerts remain separate from signature status. |
+
+The cryptographic layer and anomaly detectors answer different questions. A valid signed manifest indicates that the object matches content authenticated by a trusted key. An anomaly alert indicates that verified content looks unusual under a detector. Neither result establishes clinical correctness or malicious intent.
+
+### Sender–receiver workflow
+
+```text
+SENDER                                               RECEIVER
+  │                                                     │
+  ├─ Read DICOM and calculate configured digests       │
+  ├─ Build manifest with identifiers and manifest ID  │
+  ├─ Sign manifest with Ed25519 private key            │
+  └─ Send DICOM object + signed JSON sidecar ─────────►│
+                                                        ├─ Find signer in local trust registry
+                                                        ├─ Verify Ed25519 signature
+                                                        ├─ Compare manifest identifiers/digests
+                                                        ├─ Check replay cache (if enabled)
+                                                        │
+                                               ┌────────┴────────┐
+                                               │                 │
+                                           VERIFIED        REJECT/REVIEW
+                                               │           invalid, missing,
+                                               ▼           untrusted, changed,
+                                    Existing integrity and  or replayed manifest
+                                    AI analysis pipeline
+```
+
+The receiver establishes signer trust and validates the signature before treating the manifest digests as authoritative. If the signature, signer trust, reference, identifiers, or enabled content digests fail, the object receives a failure or review status. A successful AI result cannot override a cryptographic failure, and a successful cryptographic check does not suppress an AI anomaly alert.
+
+The prototype also includes a local replay cache, privacy-minimized audit records, and a limited research-copy transformation followed by fresh signing. HMAC-SHA256 is an optional shared-secret integrity/authentication mechanism. AES-GCM is available for files at rest; it does **not** encrypt a network connection.
+
+### Manifest and verification model
+
+The signed JSON sidecar records a schema version, manifest identifier, creation time, DICOM identifiers, digest scopes, and signer key identifier. The sender signs a canonical representation of the manifest. Depending on the selected profile, it includes:
+
+- **Canonical metadata SHA-256:** recursively serialized DICOM metadata and file-meta values; PixelData and group-length elements are excluded.
+- **PixelData SHA-256:** the raw PixelData payload.
+- **Raw-file SHA-256 (optional):** every serialized DICOM file byte, including preamble and representation details.
+
+These scopes answer different questions. A covered metadata edit changes the metadata digest; a pixel edit changes the PixelData digest; a byte-level reserialization may change the raw-file digest even when parsed metadata and PixelData remain the same. The receiver reports the failed scope instead of treating every mismatch as the same event.
+
+The receiver's trust registry stores public keys accepted locally. Keys must be authenticated out of band; receiving a public key beside a DICOM file is not a safe trust-establishment process. In an institution, key issuance, custody, rotation, revocation, and mapping key IDs to organizational identities require an operational policy. The local registry demonstrates trust checking but is not a full public-key infrastructure.
+
+### Full-fold security experiment
+
+The full-fold runner tested each scenario against all **809 test files**, producing 10,517 file-scenario observations. It uses temporary experiment keys and temporary edited copies. It does not train models and does not modify the original CPAISD files.
+
+| Security scenario | Expected receiver behavior | Observed result |
+|---|---|---|
+| Unchanged signed DICOM object | Accept trusted signature and matching digests | `VERIFIED`, 809/809 |
+| Metadata value edited after signing | Detect metadata-digest mismatch | `INTEGRITY_MISMATCH`, 809/809 |
+| PixelData byte flipped after signing | Detect pixel-digest mismatch | `INTEGRITY_MISMATCH`, 809/809 |
+| One decoded pixel changed after signing | Detect pixel-digest mismatch | `INTEGRITY_MISMATCH`, 809/809; decoded comparison confirmed one changed pixel per file |
+| Manifest digest altered without a new valid signature | Reject altered signed content | `INVALID_SIGNATURE`, 809/809 |
+| Signature bytes forged | Reject invalid signature | `INVALID_SIGNATURE`, 809/809 |
+| Signer key not in trust registry | Reject unknown signer | `UNTRUSTED_SIGNER`, 809/809 |
+| Signed manifest absent | Do not treat object as reference-verified | `MISSING_REFERENCE`, 809/809 |
+| Incorrect HMAC key supplied | Reject shared-secret authentication tag | `INVALID`, 809/809 |
+| Previously accepted manifest ID seen again | Flag possible replay for policy review | `POLICY_REVIEW_REQUIRED`, 809/809 |
+| DICOM preamble changed, parsed content retained | Raw-file scope detects byte change; content-only scope verifies | `INTEGRITY_MISMATCH`, 809/809; content-only `VERIFIED`, 809/809 |
+| Attacker creates a matching unsigned digest reference | Demonstrate that digest alone is not authenticated | Digest-only control accepts, 809/809 |
+| Authorized research-copy transform, then fresh signing | Verify transformed object against its new signature | `VERIFIED`, 809/809 |
+
+The unsigned-reference result is a deliberate negative control, not a failure of the Ed25519 verifier: if an attacker can replace both the file and its unsigned hash reference, those values can match. A signature binds the manifest to a signing key; the receiver's trust policy determines whether that key is accepted. The key ID by itself does not establish a real person's or hospital's identity.
+
+#### Timing and manifest overhead
+
+| Measurement | Mean observed value |
+|---|---:|
+| Create manifest and sign it | 15.44 ms/file |
+| End-to-end verification | 12.82 ms/file |
+| Ed25519 signing operation | 0.147 ms |
+| Ed25519 verification operation | 0.268 ms |
+| Signed envelope size | 868.4 bytes |
+| Envelope / serialized DICOM size | 0.1647% |
+
+These timing values come from the local development machine and measure file processing. They are not network latency, throughput, or a deployment benchmark. The reserialization scenario shows the effect of digest policy: a raw-file digest detects every serialized-byte change, while canonical metadata plus PixelData can remain verified if only the preamble changes.
+
+### Running the security experiment
+
+Run all scenarios on the CPAISD test fold (no training):
+
+```powershell
+python scripts/run_crypto_security_experiment.py `
+  --input data\cpaisd\test `
+  --output reports\crypto_security_full
+```
+
+For a quicker smoke check, add `--limit 10`. The runner writes scenario and performance CSVs, a JSON summary, a Markdown report, and a timing chart to the selected output directory. Temporary experiment keys and edited file copies are removed when the run exits.
+
+Run the automated tests with:
+
+```powershell
+pytest
+```
+
+The [security framework guide](SECURITY_FRAMEWORK.md) contains command examples for generating local test keys, adding a public key to a trust registry, signing and verifying one DICOM object, analyzing a directory, transforming a verified research copy, and encrypting a file at rest. Keep private keys outside the repository; never use temporary experiment keys for real medical records.
+
+### Scope and limitations
+
+This is an **application-layer secure-file-exchange prototype**, not a deployed DICOM network service. The experiment reads local files and simulates sender and receiver security scenarios. It does not open a DICOM association or transmit the test objects across a network. It does not measure TCP/TLS behavior, packet loss, throughput, concurrent sessions, or end-to-end network latency.
+
+The prototype uses signed JSON sidecars; it does not implement DICOM-native Digital Signatures. It does not provide transport encryption: the AES-GCM helper is an at-rest file wrapper and does not replace TLS. The local replay cache is not distributed replay prevention. Experiment keys are temporary and do not identify a hospital sender. The trust registry is not an institutional PKI. The limited de-identification helper does not implement the complete DICOM PS3.15 confidentiality profile or perform OCR-based pixel cleaning. Clinical correctness, external generalization, and production readiness are not established.
+
+The Computer Networks contribution is therefore a design and file-level prototype demonstrating content integrity, signer-key authentication, trust checking, and a replay check around DICOM objects. A complete network evaluation would connect separate sender and receiver processes over a controlled link, use authenticated encrypted transport, measure throughput and end-to-end latency, exercise connection failures and replay across receiver instances, and use a managed key lifecycle.
+
+See [SECURITY_FRAMEWORK.md](SECURITY_FRAMEWORK.md) for architecture and implementation details, and [the paper](experiment_cpaisd/paper/main.tex) for the formal methods and results.
