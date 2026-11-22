@@ -1,4 +1,4 @@
-"""Evaluate bounded FGSM/PGD evasion against a trained synthetic-edit U-Net.
+"""Compare targeted evasion methods against a trained synthetic-edit U-Net.
 
 The attacks are applied only to synthetic edited test copies. The original
 DICOM files remain unchanged, and the U-Net receives normalized image arrays,
@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import random
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -54,16 +55,94 @@ def _attack_evasion(model, image, epsilon, method, steps, step_size, seed, devic
     return candidate.detach()[0, 0]
 
 
+def _project_l2(candidate, source, radius):
+    delta = candidate - source
+    norm = torch.linalg.vector_norm(delta.reshape(-1), ord=2)
+    if norm > radius:
+        delta = delta * (radius / (norm + 1e-12))
+    return (source + delta).clamp(0.0, 1.0)
+
+
+def _cw_l2_evasion(model, image, *, steps=30, learning_rate=0.01,
+                   constant=1.0, l2_radius=2.0, device="cpu"):
+    """C&W-style targeted L2 optimization toward an all-clean segmentation.
+
+    The objective is squared L2 distortion plus a hinge penalty on the largest
+    tamper logit. A fixed L2 radius bounds the search; constants are prespecified
+    and are not tuned against test labels.
+    """
+    source = image.detach().to(device).unsqueeze(0).unsqueeze(0)
+    delta = torch.zeros_like(source, requires_grad=True)
+    optimizer = torch.optim.Adam([delta], lr=learning_rate)
+    for _ in range(steps):
+        candidate = (source + delta).clamp(0.0, 1.0)
+        logits = model(candidate)
+        distortion = torch.sum((candidate - source) ** 2)
+        target_penalty = F.relu(logits.max())
+        loss = distortion + constant * target_penalty
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            projected = _project_l2(source + delta, source, l2_radius)
+            delta.copy_(projected - source)
+    return (source + delta).clamp(0.0, 1.0).detach()[0, 0]
+
+
+def _deepfool_l2_evasion(model, image, *, max_steps=10, overshoot=0.02,
+                         l2_radius=2.0, device="cpu"):
+    """DeepFool-style iterative linearization of the highest tamper logit."""
+    source = image.detach().to(device).unsqueeze(0).unsqueeze(0)
+    candidate = source.clone()
+    for _ in range(max_steps):
+        candidate = candidate.detach().requires_grad_(True)
+        logits = model(candidate)
+        margin = logits.max()
+        if float(margin.detach()) <= 0.0:
+            break
+        gradient = torch.autograd.grad(margin, candidate, only_inputs=True)[0]
+        grad_sq = torch.sum(gradient ** 2).clamp_min(1e-12)
+        step = (margin.detach() + overshoot) / grad_sq * gradient
+        candidate = _project_l2(candidate.detach() - step, source, l2_radius).detach()
+    return candidate[0, 0]
+
+
+def _balanced_cap(examples, limit, seed):
+    """Choose a reproducible, round-robin subset across the selected studies."""
+    if not limit or len(examples) <= limit:
+        return examples
+    grouped = defaultdict(list)
+    for item in examples:
+        grouped[item[0]["study_group"]].append(item)
+    rng = random.Random(seed)
+    buckets = []
+    for study in sorted(grouped):
+        bucket = grouped[study]
+        rng.shuffle(bucket)
+        buckets.append(bucket)
+    chosen = []
+    while len(chosen) < limit and any(buckets):
+        for bucket in buckets:
+            if bucket and len(chosen) < limit:
+                chosen.append(bucket.pop())
+    return chosen
+
+
 def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fraction=0.20,
-                   epsilon=0.02, pgd_steps=10, pgd_step_size=0.004, device_name="cpu"):
+                   epsilon=0.02, pgd_steps=10, pgd_step_size=0.004,
+                   cw_steps=20, cw_learning_rate=0.01, cw_constant=1.0,
+                   l2_radius=2.0, deepfool_steps=10,
+                   max_images_per_family=64, device_name="cpu"):
     output_dir = Path(output_dir)
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"Output directory is not empty; choose a fresh path: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     if not 0 < attack_fraction <= 1:
         raise ValueError("attack_fraction must be in (0, 1].")
-    if epsilon < 0 or pgd_steps < 1 or pgd_step_size <= 0:
-        raise ValueError("epsilon must be nonnegative, pgd_steps >= 1, and pgd_step_size > 0.")
+    if (epsilon < 0 or pgd_steps < 1 or pgd_step_size <= 0 or cw_steps < 1
+            or cw_learning_rate <= 0 or cw_constant <= 0 or l2_radius <= 0
+            or deepfool_steps < 1 or max_images_per_family < 0):
+        raise ValueError("Invalid attack budget or optimization parameters.")
 
     device = torch.device(device_name)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -72,6 +151,7 @@ def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fracti
                             base_channels=int(config["base_channels"]))
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device).eval()
+    model.requires_grad_(False)
     image_size = int(config["image_size"])
     pixel_threshold = float(config["pixel_threshold"])
     image_threshold = float(config["image_threshold"])
@@ -86,7 +166,7 @@ def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fracti
 
     rows = []
     summary_rows = []
-    methods = ("baseline", "fgsm", "pgd")
+    methods = ("baseline", "fgsm", "bim", "pgd", "cw_l2", "deepfool_l2")
     for family_index, family in enumerate(TEST_FAMILIES):
         examples = []
         for index, record in enumerate(records):
@@ -95,93 +175,121 @@ def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fracti
             rng = random.Random(seed + index * 17 + 9001 * (family_index + 1))
             edited, truth = _apply_test_edit(record["image"], family, rng)
             examples.append((record, edited, truth))
+        candidate_count = len(examples)
+        examples = _balanced_cap(examples, max_images_per_family,
+                                 seed + family_index * 313)
 
-        outputs = {method: [] for method in methods}
+        stats = {method: {"detected": 0, "baseline_detected": 0, "success": 0,
+                          "tp": 0, "fp": 0, "fn": 0, "tn": 0}
+                 for method in methods}
         for example_index, (record, edited, truth) in enumerate(examples):
-            outputs["baseline"].append(edited)
-            outputs["fgsm"].append(_attack_evasion(
-                model, edited, epsilon, "fgsm", 1, epsilon, seed + example_index, device))
-            outputs["pgd"].append(_attack_evasion(
-                model, edited, epsilon, "pgd", pgd_steps, pgd_step_size, seed + example_index, device))
-        baseline_alarm = []
-        family_rows = []
-        for method in methods:
-            method_predictions, truth_list, predicted_list = [], [], []
-            for example_index, ((record, _, truth), image) in enumerate(zip(examples, outputs[method])):
+            attack_images = {
+                "baseline": edited,
+                "fgsm": _attack_evasion(model, edited, epsilon, "fgsm", 1,
+                                          epsilon, seed + example_index, device),
+                "bim": _attack_evasion(model, edited, epsilon, "bim", pgd_steps,
+                                        pgd_step_size, seed + example_index, device),
+                "pgd": _attack_evasion(model, edited, epsilon, "pgd", pgd_steps,
+                                        pgd_step_size, seed + example_index, device),
+                "cw_l2": _cw_l2_evasion(model, edited, steps=cw_steps,
+                                         learning_rate=cw_learning_rate,
+                                         constant=cw_constant, l2_radius=l2_radius,
+                                         device=device),
+                "deepfool_l2": _deepfool_l2_evasion(model, edited,
+                                                      max_steps=deepfool_steps,
+                                                      l2_radius=l2_radius,
+                                                      device=device),
+            }
+            truth_mask = truth.to(device=device, dtype=torch.bool)
+            baseline_alarm = None
+            file_id = hashlib.sha256(relative_key(record["path"], Path(test_dir)).encode()).hexdigest()[:16]
+            for method, image in attack_images.items():
                 with torch.no_grad():
                     probability = torch.sigmoid(model(image.to(device).unsqueeze(0).unsqueeze(0)))[0, 0]
                 score = float(probability.max().item())
-                prediction = score >= image_threshold
-                predicted_mask = probability >= pixel_threshold
-                truth_mask = truth.to(device=device, dtype=torch.bool)
-                method_predictions.append(int(prediction))
-                truth_list.append(truth_mask)
-                predicted_list.append(predicted_mask)
+                prediction = int(score >= image_threshold)
                 if method == "baseline":
-                    baseline_alarm.append(bool(prediction))
-                union = torch.count_nonzero(truth_mask | predicted_mask).item()
-                intersection = torch.count_nonzero(truth_mask & predicted_mask).item()
+                    baseline_alarm = bool(prediction)
+                    for name in methods:
+                        stats[name]["baseline_detected"] += int(baseline_alarm)
+                else:
+                    stats[method]["success"] += int(bool(baseline_alarm) and not bool(prediction))
+                stats[method]["detected"] += prediction
+                predicted_mask = probability >= pixel_threshold
+                stats[method]["tp"] += int(torch.count_nonzero(truth_mask & predicted_mask).item())
+                stats[method]["fp"] += int(torch.count_nonzero(~truth_mask & predicted_mask).item())
+                stats[method]["fn"] += int(torch.count_nonzero(truth_mask & ~predicted_mask).item())
+                stats[method]["tn"] += int(torch.count_nonzero(~truth_mask & ~predicted_mask).item())
+                intersection = int(torch.count_nonzero(truth_mask & predicted_mask).item())
+                union = int(torch.count_nonzero(truth_mask | predicted_mask).item())
+                delta = image - edited
                 rows.append({
-                    "family": family, "method": method,
-                    "file_id": hashlib.sha256(relative_key(record["path"], Path(test_dir)).encode()).hexdigest()[:16],
-                    "study_group": record["study_group"],
-                    "label": 1, "image_score": score, "image_alarm": int(prediction),
-                    "image_threshold": image_threshold,
-                    "pixel_threshold": pixel_threshold,
+                    "family": family, "method": method, "file_id": file_id,
+                    "study_group": record["study_group"], "label": 1,
+                    "image_score": score, "image_alarm": prediction,
+                    "image_threshold": image_threshold, "pixel_threshold": pixel_threshold,
                     "pixel_precision": intersection / max(1, int(torch.count_nonzero(predicted_mask).item())),
                     "pixel_recall": intersection / max(1, int(torch.count_nonzero(truth_mask).item())),
                     "pixel_iou": intersection / max(1, union),
-                    "linf_from_scripted_edit": float(torch.max(torch.abs(image - outputs["baseline"][example_index])).item()),
+                    "linf_from_scripted_edit": float(torch.max(torch.abs(delta)).item()),
+                    "l2_from_scripted_edit": float(torch.linalg.vector_norm(delta.reshape(-1), ord=2).item()),
                 })
-            tp = fp = fn = tn = 0
-            for truth_mask, prediction_mask in zip(truth_list, predicted_list):
-                tp += int(torch.count_nonzero(truth_mask & prediction_mask).item())
-                fp += int(torch.count_nonzero(~truth_mask & prediction_mask).item())
-                fn += int(torch.count_nonzero(truth_mask & ~prediction_mask).item())
-                tn += int(torch.count_nonzero(~truth_mask & ~prediction_mask).item())
-            pixel_precision = tp / (tp + fp) if tp + fp else 0.0
-            pixel_recall = tp / (tp + fn) if tp + fn else 0.0
-            pixel_iou = tp / (tp + fp + fn) if tp + fp + fn else 0.0
-            family_rows.append({
+
+        for method in methods:
+            item = stats[method]
+            tp, fp, fn = item["tp"], item["fp"], item["fn"]
+            precision = tp / (tp + fp) if tp + fp else 0.0
+            recall = tp / (tp + fn) if tp + fn else 0.0
+            summary_rows.append({
                 "family": family, "method": method, "positive_images": len(examples),
-                "image_recall": float(np.mean(method_predictions)) if method_predictions else 0.0,
-                "baseline_detected_images": int(sum(baseline_alarm)) if method == "baseline" else int(sum(baseline_alarm)),
-                "detected_images": int(sum(method_predictions)),
-                "pixel_precision": pixel_precision,
-                "pixel_recall": pixel_recall, "pixel_iou": pixel_iou,
-                "attack_success_rate": (
-                    sum(base and not pred for base, pred in zip(baseline_alarm, method_predictions)) /
-                    sum(baseline_alarm) if method != "baseline" and sum(baseline_alarm) else 0.0
-                ),
+                "image_recall": item["detected"] / max(1, len(examples)),
+                "baseline_detected_images": item["baseline_detected"],
+                "detected_images": item["detected"],
+                "pixel_precision": precision, "pixel_recall": recall,
+                "pixel_iou": tp / (tp + fp + fn) if tp + fp + fn else 0.0,
+                "attack_success_rate": item["success"] / max(1, item["baseline_detected"])
+                    if method != "baseline" else 0.0,
             })
-        summary_rows.extend(family_rows)
-        if family_rows and family_rows[0]["positive_images"] != len(examples):
-            raise RuntimeError("Unexpected positive-image count during attack evaluation.")
+        print(f"Completed {family}: evaluated {len(examples)} of {candidate_count} positive images.",
+              flush=True)
 
     summary = pd.DataFrame(summary_rows)
-    summary.to_csv(output_dir / "fgsm_pgd_summary.csv", index=False)
-    pd.DataFrame(rows).to_csv(output_dir / "fgsm_pgd_per_image.csv", index=False)
+    summary.to_csv(output_dir / "adversarial_comparison_summary.csv", index=False)
+    pd.DataFrame(rows).to_csv(output_dir / "adversarial_comparison_per_image.csv", index=False)
     config_out = {
         "checkpoint": str(Path(checkpoint_path).resolve()), "test_dir": str(Path(test_dir).resolve()),
-        "seed": seed, "attack_fraction": attack_fraction, "epsilon_linf_normalized": epsilon,
-        "fgsm_steps": 1, "pgd_steps": pgd_steps, "pgd_step_size": pgd_step_size,
+        "seed": seed, "attack_fraction": attack_fraction,
+        "max_images_per_family": max_images_per_family,
+        "epsilon_linf_normalized": epsilon,
+        "attack_budgets": {
+            "fgsm": {"norm": "L_inf", "epsilon": epsilon, "steps": 1},
+            "bim": {"norm": "L_inf", "epsilon": epsilon, "steps": pgd_steps, "step_size": pgd_step_size, "random_start": False},
+            "pgd": {"norm": "L_inf", "epsilon": epsilon, "steps": pgd_steps, "step_size": pgd_step_size, "random_start": True},
+            "cw_l2": {"norm": "L2", "radius": l2_radius, "steps": cw_steps,
+                      "learning_rate": cw_learning_rate, "constant": cw_constant},
+            "deepfool_l2": {"norm": "L2", "radius": l2_radius, "max_steps": deepfool_steps},
+        },
         "device": str(device), "image_threshold": image_threshold,
         "pixel_threshold": pixel_threshold,
         "objective": "targeted evasion: minimize BCE-with-logits against an all-clean mask",
-        "scope": "synthetic edited test images only; attacks constrained to normalized-image L-infinity epsilon",
+        "scope": "balanced synthetic edited image subset only; L-infinity and L2 budgets are different and not directly equivalent",
     }
     (output_dir / "attack_config.json").write_text(__import__("json").dumps(config_out, indent=2), encoding="utf-8")
     report = [
-        "# U-Net FGSM/PGD evasion evaluation", "",
+        "# U-Net adversarial attack comparison", "",
         f"- Test studies: {len(study_ids)}", f"- Positive studies per edit family: {positives_per_condition}",
+        f"- Maximum evaluated images per edit family: {max_images_per_family or 'all selected positives'}",
         f"- L-infinity budget in normalized image units: {epsilon}",
-        f"- PGD steps / step size: {pgd_steps} / {pgd_step_size}",
-        "- FGSM and PGD were targeted to suppress the U-Net tamper mask; attack success is reported only among synthetic edited images detected by the baseline model.",
+        f"- FGSM/BIM/PGD L-infinity budget: {epsilon}; BIM/PGD steps / step size: {pgd_steps} / {pgd_step_size}",
+        f"- C&W-style L2 radius / optimization steps: {l2_radius} / {cw_steps}",
+        f"- DeepFool-style L2 radius / maximum steps: {l2_radius} / {deepfool_steps}",
+        "- Attacks target suppression of the U-Net tamper response; attack success is reported only among synthetic edited images detected by the baseline model.",
+        "- The L-infinity and L2 attacks have different constraints and should not be interpreted as equal-budget comparisons.",
         "- These attacks test the U-Net only. Any changed DICOM PixelData would still differ from an exact clean reference hash.",
         "", "## Results", summary.to_markdown(index=False), "",
         "All adversarial samples are in-memory normalized arrays. This is a synthetic robustness test, not a real-world attack demonstration or clinical safety assessment.", "",
     ]
-    (output_dir / "FGSM_PGD_REPORT.md").write_text("\n".join(report), encoding="utf-8")
+    (output_dir / "ADVERSARIAL_COMPARISON_REPORT.md").write_text("\n".join(report), encoding="utf-8")
     return summary
 
 
@@ -196,13 +304,24 @@ def main():
                         help="L-infinity bound in normalized [0,1] image units")
     parser.add_argument("--pgd-steps", type=int, default=10)
     parser.add_argument("--pgd-step-size", type=float, default=0.004)
+    parser.add_argument("--cw-steps", type=int, default=20)
+    parser.add_argument("--cw-learning-rate", type=float, default=0.01)
+    parser.add_argument("--cw-constant", type=float, default=1.0)
+    parser.add_argument("--l2-radius", type=float, default=2.0,
+                        help="L2 radius for C&W-style and DeepFool-style attacks")
+    parser.add_argument("--deepfool-steps", type=int, default=10)
+    parser.add_argument("--max-images-per-family", type=int, default=64,
+                        help="Balanced, deterministic subset cap across selected studies; zero uses all positives")
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
     result = run_evaluation(args.checkpoint, args.test, args.output, args.seed,
                             args.attack_fraction, args.epsilon, args.pgd_steps,
-                            args.pgd_step_size, args.device)
+                            args.pgd_step_size, args.cw_steps, args.cw_learning_rate,
+                            args.cw_constant, args.l2_radius, args.deepfool_steps,
+                            args.max_images_per_family,
+                            args.device)
     print(result.to_string(index=False))
-    print(f"\nFGSM/PGD evaluation saved: {Path(args.output).resolve()}")
+    print(f"\nAdversarial attack comparison saved: {Path(args.output).resolve()}")
 
 
 if __name__ == "__main__":

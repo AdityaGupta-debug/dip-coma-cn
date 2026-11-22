@@ -1,0 +1,12 @@
+file,scenario,status,latency_ms,details
+raw.dcm,unchanged_signed_file,VERIFIED,9.3166,"{""signature_valid"": true, ""signer_id"": ""ed25519-48a217a256b58b80ddec3e41"", ""verified_scopes"": [""metadata_sha256"", ""pixel_data_sha256"", ""raw_file_sha256""]}"
+raw.dcm,metadata_change,INTEGRITY_MISMATCH,19.7754,"{""metadata_sha256"": {""actual"": ""6d9578119cef2c3246143070af3931513b7e9dccfed343f7a7f4ab6c2a4cb8c8"", ""expected"": ""845227f551beef1eb03d7dff05a47a6c88984942982e92e7b1bbc1f07bb45c49""}, ""raw_file_sha256"": {""actual"": ""fbb628372a4536cd4dacc6bae78e58317de0300a838e8c48a53043b749d78f3f"", ""expected"": ""13d2a1fcde94a7ed7b61833e42bf3e081f7379b3fbc558cd61a7590433f1f323""}}"
+raw.dcm,pixel_byte_flip,INTEGRITY_MISMATCH,20.1054,"{""pixel_data_sha256"": {""actual"": ""715285c096923412e682fea3c3df5f40b889a94dd29d674d58e46c6eeccdc39d"", ""expected"": ""faedc6166da5a349f23caa033c6173d1b13a095221989ddf0d80ece099b79a1f""}, ""raw_file_sha256"": {""actual"": ""82d73e9c5dc3899ebe6a8d74a02635325675342789f0690a1071333640c0cbe9"", ""expected"": ""13d2a1fcde94a7ed7b61833e42bf3e081f7379b3fbc558cd61a7590433f1f323""}}"
+raw.dcm,altered_unsigned_digest,INVALID_SIGNATURE,0.4433,{}
+raw.dcm,forged_signature,INVALID_SIGNATURE,0.3247,{}
+raw.dcm,untrusted_signer,UNTRUSTED_SIGNER,0.0083,{}
+raw.dcm,missing_signature,MISSING_REFERENCE,0.007,{}
+raw.dcm,incorrect_hmac_key,INVALID,0,{}
+raw.dcm,reserialization,VERIFIED,9.4992,"{""canonical_metadata_same"": true, ""pixel_bytes_same"": true, ""raw_file_bytes_same"": true}"
+raw.dcm,replayed_manifest_with_local_cache,POLICY_REVIEW_REQUIRED,10.7492,"{""first_acceptance"": ""VERIFIED""}"
+raw.dcm,authorized_deidentify_and_resign,VERIFIED,0,"{""fresh_manifest_id"": ""f7d6de97-fc52-4929-ad1f-9482d9bec8b7"", ""original_signature_valid_before_transform"": true, ""pixel_review_required"": true}"

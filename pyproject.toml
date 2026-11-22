@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ct-metadata-security-research"
 version = "2.0.0"
@@ -13,8 +17,19 @@ dependencies = [
   "streamlit>=1.38",
   "pillow>=10.0",
   "torch>=2.3.0",
-  "tabulate>=0.9"
+  "tabulate>=0.9",
+  "cryptography>=42.0"
 ]
+
+[project.scripts]
+dicom-secure = "src.security.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

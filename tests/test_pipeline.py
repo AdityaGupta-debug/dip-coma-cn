@@ -11,7 +11,7 @@ class PipelineSmokeTest(unittest.TestCase):
     def test_baseline_training_attack_detection(self):
         from scripts.make_demo_dataset import create_dataset
         from pydicom.uid import generate_uid
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
             root = Path(tmp)
             clean = root / "clean"
             study = generate_uid()

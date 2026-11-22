@@ -1,0 +1,42 @@
+{
+  "input_files": 10,
+  "scenario_rows": 130,
+  "scenario_counts": {
+    "unchanged_signed_file:VERIFIED": 10,
+    "metadata_change:INTEGRITY_MISMATCH": 10,
+    "pixel_byte_flip:INTEGRITY_MISMATCH": 10,
+    "tiny_single_pixel_change:INTEGRITY_MISMATCH": 10,
+    "forged_unsigned_reference:UNSIGNED_REFERENCE_ACCEPTS": 10,
+    "altered_unsigned_digest:INVALID_SIGNATURE": 10,
+    "forged_signature:INVALID_SIGNATURE": 10,
+    "untrusted_signer:UNTRUSTED_SIGNER": 10,
+    "missing_signature:MISSING_REFERENCE": 10,
+    "incorrect_hmac_key:INVALID": 10,
+    "reserialization:INTEGRITY_MISMATCH": 10,
+    "replayed_manifest_with_local_cache:POLICY_REVIEW_REQUIRED": 10,
+    "authorized_deidentify_and_resign:VERIFIED": 10
+  },
+  "mean_signing_latency_ms": 17.022939999878872,
+  "mean_verification_latency_ms": 11.33063999877777,
+  "mean_manifest_bytes": 868.5,
+  "mean_performance_ms": {
+    "manifest_create_and_sign_ms": 17.022939999878872,
+    "end_to_end_verify_ms": 11.33063999877777,
+    "raw_file_sha256_ms": 3.256399999372661,
+    "metadata_sha256_ms": 4.6831300016492605,
+    "pixel_data_sha256_ms": 0.7056199989165179,
+    "hmac_generation_ms": 0.03739000094356015,
+    "hmac_verification_ms": 0.014090001059230417,
+    "ed25519_signing_ms": 0.1388099990435876,
+    "ed25519_verification_ms": 0.26339999749325216
+  },
+  "mean_manifest_overhead_fraction": 0.001647776213586707,
+  "results_csv": "D:\\Desktop\\dip-coma-cn\\reports\\crypto_security_smoke_final\\security_scenarios.csv",
+  "performance_csv": "D:\\Desktop\\dip-coma-cn\\reports\\crypto_security_smoke_final\\security_performance.csv",
+  "limitations": [
+    "Independent temporary experiment keys; no hospital identity claims.",
+    "Metrics describe only the selected local DICOM test inputs.",
+    "The replay cache is a local stateful demo and must be protected; it is not distributed replay prevention."
+  ],
+  "timing_plot": "D:\\Desktop\\dip-coma-cn\\reports\\crypto_security_smoke_final\\security_operation_timings.png"
+}

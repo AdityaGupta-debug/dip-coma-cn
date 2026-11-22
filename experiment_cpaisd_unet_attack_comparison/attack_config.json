@@ -1,0 +1,46 @@
+{
+  "checkpoint": "D:\\Desktop\\dip-coma-cn\\experiment_cpaisd_supervised_localization_512_30ep_complete\\unet_localizer.pt",
+  "test_dir": "D:\\Desktop\\dip-coma-cn\\data\\cpaisd\\test",
+  "seed": 42,
+  "attack_fraction": 0.2,
+  "max_images_per_family": 64,
+  "epsilon_linf_normalized": 0.02,
+  "attack_budgets": {
+    "fgsm": {
+      "norm": "L_inf",
+      "epsilon": 0.02,
+      "steps": 1
+    },
+    "bim": {
+      "norm": "L_inf",
+      "epsilon": 0.02,
+      "steps": 10,
+      "step_size": 0.004,
+      "random_start": false
+    },
+    "pgd": {
+      "norm": "L_inf",
+      "epsilon": 0.02,
+      "steps": 10,
+      "step_size": 0.004,
+      "random_start": true
+    },
+    "cw_l2": {
+      "norm": "L2",
+      "radius": 2.0,
+      "steps": 20,
+      "learning_rate": 0.01,
+      "constant": 1.0
+    },
+    "deepfool_l2": {
+      "norm": "L2",
+      "radius": 2.0,
+      "max_steps": 10
+    }
+  },
+  "device": "cpu",
+  "image_threshold": 1.0,
+  "pixel_threshold": 0.0008582245427533027,
+  "objective": "targeted evasion: minimize BCE-with-logits against an all-clean mask",
+  "scope": "balanced synthetic edited image subset only; L-infinity and L2 budgets are different and not directly equivalent"
+}

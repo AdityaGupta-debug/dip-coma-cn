@@ -74,7 +74,8 @@ def train_autoencoder(clean_dir, model_path, validation_dir=None,
                       threshold_percentile=99.0, random_state=42,
                       max_train_files=30000, max_validation_files=10000,
                       optimizer_name="adam", momentum=0.9, weight_decay=1e-4,
-                      reconstruction_loss="mse", validation_paths=None):
+                      reconstruction_loss="mse", validation_paths=None,
+                      feature_loss_weights=None):
     torch.manual_seed(random_state)
     paths = find_dicom_files(clean_dir)
     if len(paths) < 10:
@@ -95,6 +96,18 @@ def train_autoencoder(clean_dir, model_path, validation_dir=None,
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MetadataAutoencoder(X.shape[1]).to(device)
+    feature_names = vectorizer.get_feature_names_out()
+    named_weights = dict(feature_loss_weights or {})
+    unknown_weight_names = sorted(set(named_weights) - set(map(str, feature_names)))
+    if unknown_weight_names:
+        raise ValueError(f"Unknown feature loss weight names: {unknown_weight_names}")
+    feature_weights = np.ones(X.shape[1], dtype=np.float32)
+    feature_index = {str(name): index for index, name in enumerate(feature_names)}
+    for name, weight in named_weights.items():
+        if float(weight) <= 0:
+            raise ValueError("Feature loss weights must be positive")
+        feature_weights[feature_index[name]] = float(weight)
+    feature_weights_tensor = torch.from_numpy(feature_weights).to(device)
     optimizer_name = str(optimizer_name).lower().replace(" ", "_")
     optimizer_options = {
         "adam": lambda: torch.optim.Adam(model.parameters(), lr=learning_rate),
@@ -121,9 +134,11 @@ def train_autoencoder(clean_dir, model_path, validation_dir=None,
         with torch.no_grad():
             for start in range(0, len(matrix), 1024):
                 batch = torch.from_numpy(matrix[start:start + 1024]).to(device)
-                values.append(_reconstruction_loss_elements(
+                elements = _reconstruction_loss_elements(
                     batch, model(batch), reconstruction_loss
-                ).mean(dim=1).cpu().numpy())
+                )
+                values.append(((elements * feature_weights_tensor).sum(dim=1) /
+                               feature_weights_tensor.sum()).cpu().numpy())
         return float(np.concatenate(values).mean())
 
     loss_history = {"train": [], "validation": []}
@@ -132,9 +147,10 @@ def train_autoencoder(clean_dir, model_path, validation_dir=None,
         for (batch,) in loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            loss = _reconstruction_loss_elements(
+            elements = _reconstruction_loss_elements(
                 batch, model(batch), reconstruction_loss
-            ).mean()
+            )
+            loss = (elements * feature_weights_tensor).sum(dim=1).mean() / feature_weights_tensor.sum()
             loss.backward()
             optimizer.step()
         loss_history["train"].append(matrix_loss(X))
@@ -148,9 +164,9 @@ def train_autoencoder(clean_dir, model_path, validation_dir=None,
         with torch.no_grad():
             x = torch.from_numpy(matrix).to(device)
             reconstructed = model(x)
-            return _reconstruction_loss_elements(
-                x, reconstructed, reconstruction_loss
-            ).mean(dim=1).cpu().numpy()
+            elements = _reconstruction_loss_elements(x, reconstructed, reconstruction_loss)
+            return ((elements * feature_weights_tensor).sum(dim=1) /
+                    feature_weights_tensor.sum()).cpu().numpy()
 
     calibration = errors(X_val if X_val is not None else X)
     threshold = float(np.percentile(calibration, threshold_percentile))
@@ -162,6 +178,7 @@ def train_autoencoder(clean_dir, model_path, validation_dir=None,
         "threshold_source": "clean_validation" if X_val is not None else "clean_training_fallback",
         "epochs": int(epochs), "optimizer": optimizer_name,
         "reconstruction_loss": reconstruction_loss,
+        "feature_loss_weights": named_weights,
         "loss_history": loss_history,
         "learning_rate": float(learning_rate), "momentum": float(momentum),
         "weight_decay": float(weight_decay), "random_state": int(random_state),
@@ -184,7 +201,14 @@ def predict_autoencoder_with_explanations(datasets, model_path, top_n=5):
         contributions = _reconstruction_loss_elements(
             x, reconstructed, bundle.get("reconstruction_loss", "mse")
         )
-        errors = torch.mean(contributions, dim=1).numpy()
+        raw_weights = bundle.get("feature_loss_weights", {})
+        feature_names = bundle["vectorizer"].get_feature_names_out()
+        feature_index = {str(name): index for index, name in enumerate(feature_names)}
+        weights = torch.ones(contributions.shape[1], dtype=contributions.dtype)
+        for name, weight in raw_weights.items():
+            weights[feature_index[name]] = float(weight)
+        contributions = contributions * weights
+        errors = (contributions.sum(dim=1) / weights.sum()).numpy()
         contributions = contributions.numpy()
     threshold = bundle["threshold"]
     feature_names = bundle["vectorizer"].get_feature_names_out()

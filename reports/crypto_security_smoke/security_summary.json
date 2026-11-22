@@ -1,0 +1,26 @@
+{
+  "input_files": 1,
+  "scenario_rows": 11,
+  "scenario_counts": {
+    "unchanged_signed_file:VERIFIED": 1,
+    "metadata_change:INTEGRITY_MISMATCH": 1,
+    "pixel_byte_flip:INTEGRITY_MISMATCH": 1,
+    "altered_unsigned_digest:INVALID_SIGNATURE": 1,
+    "forged_signature:INVALID_SIGNATURE": 1,
+    "untrusted_signer:UNTRUSTED_SIGNER": 1,
+    "missing_signature:MISSING_REFERENCE": 1,
+    "incorrect_hmac_key:INVALID": 1,
+    "reserialization:VERIFIED": 1,
+    "replayed_manifest_with_local_cache:POLICY_REVIEW_REQUIRED": 1,
+    "authorized_deidentify_and_resign:VERIFIED": 1
+  },
+  "mean_signing_latency_ms": 24.952799998573028,
+  "mean_verification_latency_ms": 9.316600000602193,
+  "mean_manifest_bytes": 868.0,
+  "results_csv": "D:\\Desktop\\dip-coma-cn\\reports\\crypto_security_smoke\\security_scenarios.csv",
+  "limitations": [
+    "Independent temporary experiment keys; no hospital identity claims.",
+    "Metrics describe only the selected local DICOM test inputs.",
+    "The replay cache is a local stateful demo and must be protected; it is not distributed replay prevention."
+  ]
+}

@@ -23,4 +23,12 @@ reports/*.csv
 reports/*.png
 reports/*.md
 *.key
+*.pem
+*.secret
+security_audit.jsonl
 .env
+/.uv-cache-dicom-security/
+/ct_metadata_security_research.egg-info/
+
+!experiment_cpaisd_unet_attack_comparison/
+!experiment_cpaisd_unet_attack_comparison/*

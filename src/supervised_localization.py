@@ -21,6 +21,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.func import functional_call
 from sklearn.metrics import (accuracy_score, average_precision_score, f1_score,
                              precision_score, recall_score, roc_auc_score)
 from torch.utils.data import DataLoader, Dataset
@@ -273,14 +274,56 @@ class SyntheticValidationDataset(Dataset):
         return edited.unsqueeze(0), mask.float().unsqueeze(0), family
 
 
-def _segmentation_loss(logits, target, positive_weight):
+def _segmentation_components(logits, target, positive_weight):
     weight = torch.tensor([positive_weight], device=logits.device, dtype=logits.dtype)
     bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=weight)
     probability = torch.sigmoid(logits)
     intersection = (probability * target).sum(dim=(1, 2, 3))
     denominator = probability.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
     dice = 1.0 - ((2.0 * intersection + 1.0) / (denominator + 1.0)).mean()
-    return 0.5 * bce + 0.5 * dice
+    return bce, dice
+
+
+def _segmentation_loss(logits, target, positive_weight, bce_weight=0.5):
+    bce, dice = _segmentation_components(logits, target, positive_weight)
+    return bce_weight * bce + (1.0 - bce_weight) * dice
+
+
+def _bilevel_weight_update(model, train_inputs, train_masks, validation_inputs,
+                           validation_masks, alpha_logit, meta_optimizer,
+                           positive_weight, inner_step_size):
+    """One-step differentiable unrolled hypergradient update for WBCE/Dice alpha."""
+    model.eval()  # Keep BatchNorm buffers fixed during the differentiable proxy step.
+    parameters = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+    train_logits = functional_call(model, (parameters, buffers), (train_inputs,))
+    train_bce, train_dice = _segmentation_components(
+        train_logits, train_masks, positive_weight
+    )
+    alpha = torch.sigmoid(alpha_logit)
+    inner_objective = alpha * train_bce + (1.0 - alpha) * train_dice
+    gradients = torch.autograd.grad(
+        inner_objective, tuple(parameters.values()), create_graph=True
+    )
+    updated_parameters = {
+        name: parameter - inner_step_size * gradient
+        for (name, parameter), gradient in zip(parameters.items(), gradients)
+    }
+    validation_logits = functional_call(
+        model, (updated_parameters, buffers), (validation_inputs,)
+    )
+    validation_bce, validation_dice = _segmentation_components(
+        validation_logits, validation_masks, positive_weight
+    )
+    outer_objective = validation_bce + validation_dice
+    hypergradient = torch.autograd.grad(outer_objective, alpha_logit)[0]
+    meta_optimizer.zero_grad(set_to_none=True)
+    alpha_logit.grad = hypergradient.detach()
+    meta_optimizer.step()
+    with torch.no_grad():
+        alpha_logit.clamp_(-6.0, 6.0)
+    model.train()
+    return float(alpha.detach()), float(outer_objective.detach()), float(hypergradient.detach())
 
 
 def _infer(model, loader, device):
@@ -411,7 +454,11 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
                                 max_validation_attack_files=256, max_test_files=0,
                                 attack_fraction=0.20,
                                 pixel_quantile=99.5, image_quantile=99.0,
-                                base_channels=8, device_name="auto", architecture="unet"):
+                                base_channels=8, device_name="auto", architecture="unet",
+                                loss_weighting="fixed", initial_bce_weight=0.5,
+                                alpha_learning_rate=1e-3,
+                                bilevel_meta_learning_rate=0.01,
+                                bilevel_inner_step_size=1e-3):
     start_time = time.perf_counter()
     output = Path(output_dir).resolve()
     if output.exists() and any(output.iterdir()):
@@ -420,6 +467,10 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         raise ValueError("image_size must be at least 64 and divisible by 16.")
     if not 0 < attack_fraction <= 1:
         raise ValueError("attack_fraction must be in (0, 1].")
+    if loss_weighting not in {"fixed", "learnable", "bilevel"}:
+        raise ValueError("loss_weighting must be fixed, learnable, or bilevel.")
+    if not 0.0 <= initial_bce_weight <= 1.0:
+        raise ValueError("initial_bce_weight must be in [0, 1].")
     output.mkdir(parents=True, exist_ok=True)
 
     random.seed(seed)
@@ -450,11 +501,23 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         raise ValueError("No decodable single-frame images found after pixel decoding.")
 
     train_dataset = SyntheticTrainingDataset(train_paths, image_size, seed)
+    train_generator = torch.Generator().manual_seed(seed + 7_919)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=0, pin_memory=device.type == "cuda")
+                              num_workers=0, pin_memory=device.type == "cuda",
+                              generator=train_generator)
     model = build_localizer(architecture=architecture, base_channels=base_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    validation_attack_records = validation_images
+    validation_groups = sorted({item["study_group"] for item in validation_images})
+    if len(validation_groups) < 2:
+        raise ValueError("Study-disjoint validation weighting needs at least two validation studies.")
+    midpoint = max(1, len(validation_groups) // 2)
+    alpha_validation_studies = set(validation_groups[:midpoint])
+    selection_validation_studies = set(validation_groups[midpoint:])
+    alpha_validation_records = [item for item in validation_images
+                                if item["study_group"] in alpha_validation_studies]
+    selection_validation_records = [item for item in validation_images
+                                   if item["study_group"] in selection_validation_studies]
+    validation_attack_records = selection_validation_records
     if max_validation_attack_files and len(validation_attack_records) > max_validation_attack_files:
         attack_selection_rng = random.Random(seed + 65_537)
         chosen = sorted(attack_selection_rng.sample(range(len(validation_attack_records)),
@@ -464,27 +527,85 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         SyntheticValidationDataset(validation_attack_records, seed),
         batch_size=batch_size, shuffle=False, num_workers=0,
         pin_memory=device.type == "cuda")
+    alpha_validation_records_for_meta = alpha_validation_records
+    if max_validation_attack_files and len(alpha_validation_records_for_meta) > max_validation_attack_files:
+        alpha_rng = random.Random(seed + 131_071)
+        alpha_indices = sorted(alpha_rng.sample(range(len(alpha_validation_records_for_meta)),
+                                                max_validation_attack_files))
+        alpha_validation_records_for_meta = [alpha_validation_records_for_meta[index]
+                                             for index in alpha_indices]
+    validation_meta_loader = DataLoader(
+        SyntheticValidationDataset(alpha_validation_records_for_meta, seed),
+        batch_size=batch_size, shuffle=True, num_workers=0,
+        pin_memory=device.type == "cuda",
+        generator=torch.Generator().manual_seed(seed + 15_827))
     history = []
     best_state = None
     best_epoch = None
     best_validation_iou = -1.0
     best_validation_rows = None
+    best_alpha = initial_bce_weight
+    alpha_initial_logit = float(np.log(max(initial_bce_weight, 1e-6) /
+                                       max(1.0 - initial_bce_weight, 1e-6)))
+    alpha_logit = nn.Parameter(torch.tensor(alpha_initial_logit, device=device,
+                                            dtype=torch.float32))
+    alpha_optimizer = (torch.optim.Adam([alpha_logit], lr=alpha_learning_rate)
+                       if loss_weighting == "learnable" else None)
+    meta_optimizer = (torch.optim.Adam([alpha_logit], lr=bilevel_meta_learning_rate)
+                      if loss_weighting == "bilevel" else None)
+    alpha_history = []
+    meta_validation_history = []
+    meta_gradient_history = []
     for epoch in range(epochs):
         train_dataset.set_epoch(epoch)
         model.train()
+        if loss_weighting == "bilevel":
+            validation_meta_batch = next(iter(validation_meta_loader))
+            validation_meta_inputs = validation_meta_batch[0].to(device, non_blocking=True)
+            validation_meta_masks = validation_meta_batch[1].to(device, non_blocking=True)
         losses = []
-        for inputs, masks in train_loader:
+        epoch_meta_validation = float("nan")
+        epoch_hypergradient = float("nan")
+        for batch_index, (inputs, masks) in enumerate(train_loader):
             inputs = inputs.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
+            if loss_weighting == "bilevel" and batch_index == 0:
+                _, epoch_meta_validation, epoch_hypergradient = _bilevel_weight_update(
+                    model, inputs, masks, validation_meta_inputs, validation_meta_masks,
+                    alpha_logit, meta_optimizer, positive_weight=12.0,
+                    inner_step_size=bilevel_inner_step_size,
+                )
             optimizer.zero_grad(set_to_none=True)
+            if alpha_optimizer is not None:
+                alpha_optimizer.zero_grad(set_to_none=True)
             logits = model(inputs)
-            loss = _segmentation_loss(logits, masks, positive_weight=12.0)
+            if loss_weighting == "fixed":
+                alpha = initial_bce_weight
+            else:
+                alpha = torch.sigmoid(alpha_logit)
+                if loss_weighting == "bilevel":
+                    alpha = alpha.detach()
+            bce, dice = _segmentation_components(logits, masks, positive_weight=12.0)
+            loss = alpha * bce + (1.0 - alpha) * dice
             loss.backward()
             optimizer.step()
+            if alpha_optimizer is not None:
+                alpha_optimizer.step()
+                with torch.no_grad():
+                    alpha_logit.clamp_(-6.0, 6.0)
             losses.append(float(loss.detach().cpu()))
+        learned_alpha = (float(torch.sigmoid(alpha_logit).detach().cpu())
+                         if loss_weighting != "fixed" else float(initial_bce_weight))
+        alpha_history.append(learned_alpha)
+        meta_validation_history.append(epoch_meta_validation)
+        meta_gradient_history.append(epoch_hypergradient)
         mean_loss = float(np.mean(losses)) if losses else float("nan")
         validation_metrics = _validation_localization_metrics(model, validation_attack_loader, device)
         history_row = {"epoch": epoch + 1, "training_loss": mean_loss,
+                       "bce_weight": learned_alpha,
+                       "dice_weight": 1.0 - learned_alpha,
+                       "bilevel_validation_objective": epoch_meta_validation,
+                       "bilevel_hypergradient": epoch_hypergradient,
                        "validation_macro_pixel_dice": validation_metrics["macro_pixel_dice"],
                        "validation_macro_pixel_iou": validation_metrics["macro_pixel_iou"]}
         for family_metrics in validation_metrics["by_family"]:
@@ -498,6 +619,7 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
             best_state = {key: value.detach().cpu().clone()
                           for key, value in model.state_dict().items()}
             best_validation_rows = validation_metrics["by_family"]
+            best_alpha = learned_alpha
         print(f"Epoch {epoch + 1}/{epochs}: train_loss={mean_loss:.5f}; "
               f"val_Dice={validation_metrics['macro_pixel_dice']:.4f}; "
               f"val_IoU={validation_metrics['macro_pixel_iou']:.4f}; "
@@ -511,7 +633,7 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         output / "validation_mask_metrics.csv", index=False)
 
     val_loader = DataLoader(CleanValidationDataset(
-        [item["path"] for item in validation_images], image_size),
+        [item["path"] for item in selection_validation_records], image_size),
         batch_size=batch_size, shuffle=False, num_workers=0,
         pin_memory=device.type == "cuda")
     rng = np.random.default_rng(seed)
@@ -615,6 +737,9 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         binary.update({
             "condition": family,
             "n_images": int(len(frame)), "n_positive_images": int(sum(labels)),
+            "loss_weighting": loss_weighting,
+            "bce_weight": best_alpha,
+            "dice_weight": 1.0 - best_alpha,
             "image_auroc": _safe_auc(np.asarray(labels), np.asarray(scores), roc_auc_score),
             "image_auprc": _safe_auc(np.asarray(labels), np.asarray(scores), average_precision_score),
             "clean_test_image_fpr": clean_image_fpr,
@@ -645,6 +770,9 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
                    "pixel_quantile": pixel_quantile, "image_quantile": image_quantile,
                    "seed": seed, "train_families": list(TRAIN_FAMILIES),
                    "withheld_test_family": "copy_move_unseen"},
+        "loss_weighting": loss_weighting,
+        "bce_weight": best_alpha,
+        "dice_weight": 1.0 - best_alpha,
     }
     checkpoint_name = "attention_unet_localizer.pt" if architecture == "attention_unet" else "unet_localizer.pt"
     torch.save(checkpoint, output / checkpoint_name)
@@ -662,6 +790,16 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         "validation_metric_threshold": 0.5,
         "batch_size": batch_size, "base_channels": base_channels,
         "architecture": architecture,
+        "loss_weighting": loss_weighting,
+        "initial_bce_weight": initial_bce_weight,
+        "selected_bce_weight": best_alpha,
+        "selected_dice_weight": 1.0 - best_alpha,
+        "alpha_learning_rate": alpha_learning_rate,
+        "bilevel_meta_learning_rate": bilevel_meta_learning_rate,
+        "bilevel_inner_step_size": bilevel_inner_step_size,
+        "alpha_validation_studies": len(alpha_validation_studies),
+        "checkpoint_selection_validation_studies": len(selection_validation_studies),
+        "alpha_validation_images_used": len(alpha_validation_records_for_meta),
         "device": str(device), "seed": seed, "pixel_threshold": pixel_threshold,
         "image_threshold": image_threshold, "pixel_threshold_clean_quantile": pixel_quantile,
         "image_threshold_clean_quantile": image_quantile,
@@ -680,13 +818,16 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
     report = [
         "# Supervised DICOM pixel-tamper localization", "",
         f"The {architecture} model is trained to segment synthetic pixel edits. The model receives each image independently; it does not receive a clean counterpart or a hash reference at inference time.",
+        f"The compound segmentation loss is {best_alpha:.4f} WBCE + {1.0 - best_alpha:.4f} Dice at the selected checkpoint (positive-pixel BCE weight remains 12). Weighting mode: {loss_weighting}.",
         "Training edit families are localized patches and sparse low-amplitude changes. The copy-move family is withheld from training and evaluated as a synthetic out-of-family condition.",
-        "Thresholds are calibrated using clean validation images only. Pixel masks are resized to the model grid before evaluation; they are not native-resolution clinical annotations.", "",
+        "Thresholds are calibrated using clean validation images only. For study-disjoint adaptive weighting, validation studies are split into coefficient-update and checkpoint-selection/calibration groups; the test fold is untouched. Bilevel mode uses a one-inner-step differentiable hypergradient approximation once per epoch. Pixel masks are resized to the model grid before evaluation; they are not native-resolution clinical annotations.", "",
         f"- Train images: {len(train_paths)} (cap={max_train_files or 'all'})",
         f"- Validation images: {len(validation_images)}",
         f"- Test images: {len(test_images)} across {len(study_ids)} studies",
         f"- Device: {device}; epochs completed: {len(history)}; input: {image_size}x{image_size}",
         f"- Architecture: {architecture}; base channels: {base_channels}",
+        f"- Loss-weighting mode: {loss_weighting}; selected WBCE/Dice coefficients: {best_alpha:.4f}/{1.0 - best_alpha:.4f}",
+        f"- Validation studies: {len(validation_groups)} total; {len(alpha_validation_studies)} coefficient-update; {len(selection_validation_studies)} checkpoint-selection/calibration",
         f"- Best epoch selected by validation macro pixel IoU: {best_epoch} ({best_validation_iou:.4f})",
         f"- Synthetic-mask validation images: {len(validation_attack_records)}; selection threshold: 0.5",
         f"- Clean-test image FPR at calibrated threshold: {clean_image_fpr:.4f}",

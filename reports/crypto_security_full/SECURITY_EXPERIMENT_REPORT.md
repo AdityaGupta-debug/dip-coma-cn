@@ -1,0 +1,45 @@
+# DICOM Cryptographic Security Experiment
+
+- Held-out DICOM files: 809
+- Scenario rows: 10517
+- Mean signed envelope: 868.4 bytes
+- Mean manifest storage overhead: 0.1647% of DICOM file size
+- Keys were generated temporarily for this run and deleted at exit; these results do not identify a hospital signer.
+
+## Scenario outcomes
+
+| Scenario | Outcome | Files |
+|---|---|---:|
+| altered_unsigned_digest | INVALID_SIGNATURE | 809 |
+| authorized_deidentify_and_resign | VERIFIED | 809 |
+| forged_signature | INVALID_SIGNATURE | 809 |
+| forged_unsigned_reference | UNSIGNED_REFERENCE_ACCEPTS | 809 |
+| incorrect_hmac_key | INVALID | 809 |
+| metadata_change | INTEGRITY_MISMATCH | 809 |
+| missing_signature | MISSING_REFERENCE | 809 |
+| pixel_byte_flip | INTEGRITY_MISMATCH | 809 |
+| replayed_manifest_with_local_cache | POLICY_REVIEW_REQUIRED | 809 |
+| reserialization | INTEGRITY_MISMATCH | 809 |
+| tiny_single_pixel_change | INTEGRITY_MISMATCH | 809 |
+| unchanged_signed_file | VERIFIED | 809 |
+| untrusted_signer | UNTRUSTED_SIGNER | 809 |
+
+An unsigned forged reference matches its attacker-modified file by construction; the signed verifier returns `MISSING_REFERENCE` because no signature is present. The single-pixel scenario asserts exactly one changed decoded value for every supported test object.
+
+## Mean operation timings
+
+| Operation | Mean time per file (ms) |
+|---|---:|
+| manifest create and sign ms | 15.4391 |
+| end to end verify ms | 12.8176 |
+| raw file sha256 ms | 2.5129 |
+| metadata sha256 ms | 5.4873 |
+| pixel data sha256 ms | 0.7311 |
+| hmac generation ms | 0.0342 |
+| hmac verification ms | 0.0146 |
+| ed25519 signing ms | 0.1470 |
+| ed25519 verification ms | 0.2684 |
+
+![Operation timing chart](security_operation_timings.png)
+
+These values are local prototype timings, not deployment benchmarks. The replay cache is a local stateful demo and must be protected; it is not distributed replay prevention. Pixel editing was tested only for the supported uncompressed single-frame CPAISD objects.

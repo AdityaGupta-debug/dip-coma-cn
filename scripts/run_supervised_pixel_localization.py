@@ -39,6 +39,16 @@ def main():
     parser.add_argument("--base-channels", type=int, default=8)
     parser.add_argument("--architecture", choices=["unet", "attention_unet"], default="unet",
                         help="Model architecture; use attention_unet for attention-gated skip connections")
+    parser.add_argument("--loss-weighting", choices=["fixed", "learnable", "bilevel"],
+                        default="fixed", help="WBCE/Dice coefficient strategy")
+    parser.add_argument("--initial-bce-weight", type=float, default=0.5,
+                        help="Initial/fixed WBCE coefficient; Dice weight is 1-alpha")
+    parser.add_argument("--alpha-learning-rate", type=float, default=0.001,
+                        help="Learning rate for directly learnable alpha updates")
+    parser.add_argument("--bilevel-meta-learning-rate", type=float, default=0.01,
+                        help="Adam learning rate for bilevel hypergradient updates")
+    parser.add_argument("--bilevel-inner-step-size", type=float, default=1e-3,
+                        help="One-step SGD proxy step used to compute the unrolled hypergradient")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or another torch device")
     args = parser.parse_args()
 
@@ -52,6 +62,11 @@ def main():
         attack_fraction=args.attack_fraction, pixel_quantile=args.pixel_quantile,
         image_quantile=args.image_quantile, base_channels=args.base_channels,
         device_name=args.device, architecture=args.architecture,
+        loss_weighting=args.loss_weighting,
+        initial_bce_weight=args.initial_bce_weight,
+        alpha_learning_rate=args.alpha_learning_rate,
+        bilevel_meta_learning_rate=args.bilevel_meta_learning_rate,
+        bilevel_inner_step_size=args.bilevel_inner_step_size,
     )
     print(summary.to_string(index=False))
     print(f"\nSaved: {Path(args.output).resolve()}")

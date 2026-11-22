@@ -1,5 +1,7 @@
 # DICOM Brain CT Integrity: Metadata + Pixel Tampering Detection (In-Depth Explainer)
 
+> New cryptographic signing, HMAC, verification, privacy-copy, and security experiment documentation: [SECURITY_FRAMEWORK.md](SECURITY_FRAMEWORK.md).
+
 > Paper: *Reference-Based Integrity Checking and Metadata Anomaly Detection for DICOM Brain CT: A Controlled Study of Metadata and Pixel Tampering*
 > Authors: Aditya Upendra Gupta, Aaditya Awasthi, Nidal, Sudhawalli
 > Dataset: CPAISD (non-contrast brain CT, hyperacute ischemic stroke)
