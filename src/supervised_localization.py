@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch.func import functional_call
 from sklearn.metrics import (accuracy_score, average_precision_score, f1_score,
                              precision_score, recall_score, roc_auc_score)
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from .dicom_io import find_dicom_files, read_dataset, relative_key
 from .no_reference_pixel import _normalized_image
@@ -52,7 +52,7 @@ class ConvBlock(nn.Module):
 
 class UNetLocalizer(nn.Module):
     """Compact U-Net that returns a per-pixel tamper-logit map."""
-    def __init__(self, base_channels: int = 8):
+    def __init__(self, base_channels: int = 24):
         super().__init__()
         b = base_channels
         self.enc1 = ConvBlock(1, b)
@@ -114,7 +114,7 @@ class AttentionGate(nn.Module):
 
 class AttentionUNetLocalizer(nn.Module):
     """U-Net variant that gates skip features with decoder attention."""
-    def __init__(self, base_channels: int = 8):
+    def __init__(self, base_channels: int = 24):
         super().__init__()
         b = base_channels
         self.enc1 = ConvBlock(1, b)
@@ -154,7 +154,7 @@ class AttentionUNetLocalizer(nn.Module):
         return self.output(d1)
 
 
-def build_localizer(architecture: str = "unet", base_channels: int = 8):
+def build_localizer(architecture: str = "unet", base_channels: int = 24):
     if architecture == "unet":
         return UNetLocalizer(base_channels=base_channels)
     if architecture == "attention_unet":
@@ -247,6 +247,26 @@ class SyntheticTrainingDataset(Dataset):
         return edited.unsqueeze(0), mask.float().unsqueeze(0)
 
 
+class MixedAdversarialTrainingDataset(Dataset):
+    """Return clean sources and fresh standard edits for online PGD training."""
+    def __init__(self, paths: list[Path], image_size: int, seed: int):
+        self.paths, self.image_size, self.seed = paths, image_size, seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        clean = _image_tensor(self.paths[index], self.image_size)
+        rng = random.Random(self.seed + self.epoch * len(self.paths) + index)
+        family = TRAIN_FAMILIES[rng.randrange(len(TRAIN_FAMILIES))]
+        edited, mask = _apply_train_edit(clean, family, rng)
+        return clean.unsqueeze(0), edited.unsqueeze(0), mask.float().unsqueeze(0)
+
+
 class CleanValidationDataset(Dataset):
     def __init__(self, paths: list[Path], image_size: int):
         self.paths, self.image_size = paths, image_size
@@ -260,8 +280,8 @@ class CleanValidationDataset(Dataset):
 
 class SyntheticValidationDataset(Dataset):
     """Fixed, deterministic synthetic edits on clean validation images."""
-    def __init__(self, records: list[dict], seed: int):
-        self.records, self.seed = records, seed
+    def __init__(self, records: list[dict], seed: int, include_clean: bool = False):
+        self.records, self.seed, self.include_clean = records, seed, include_clean
 
     def __len__(self):
         return len(self.records)
@@ -271,6 +291,8 @@ class SyntheticValidationDataset(Dataset):
         family = TRAIN_FAMILIES[index % len(TRAIN_FAMILIES)]
         rng = random.Random(self.seed + 1_000_003 + index * 31)
         edited, mask = _apply_train_edit(image, family, rng)
+        if self.include_clean:
+            return image.unsqueeze(0), edited.unsqueeze(0), mask.float().unsqueeze(0), family
         return edited.unsqueeze(0), mask.float().unsqueeze(0), family
 
 
@@ -289,10 +311,44 @@ def _segmentation_loss(logits, target, positive_weight, bce_weight=0.5):
     return bce_weight * bce + (1.0 - bce_weight) * dice
 
 
+def _image_scores_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Use an unsaturated image score so clean quantiles remain discriminative."""
+    return logits.flatten(start_dim=1).amax(dim=1)
+
+
+def _generate_pgd_evasion(model, source, *, epsilon=0.02, step_size=0.004,
+                          steps=6, seed=42, random_start=True):
+    """Online targeted PGD toward an all-clean mask; preserve model BN buffers."""
+    was_training = model.training
+    model.eval()  # BatchNorm must not absorb adversarial-batch statistics.
+    source = source.detach()
+    generator = torch.Generator(device=source.device)
+    generator.manual_seed(int(seed))
+    if random_start:
+        candidate = source + torch.empty_like(source).uniform_(-epsilon, epsilon, generator=generator)
+        candidate = candidate.clamp(0.0, 1.0)
+    else:
+        candidate = source.clone()
+    with torch.enable_grad():
+        for _ in range(steps):
+            candidate = candidate.detach().requires_grad_(True)
+            logits = model(candidate)
+            clean_target = torch.zeros_like(logits)
+            evasion_loss = F.binary_cross_entropy_with_logits(logits, clean_target)
+            gradient = torch.autograd.grad(evasion_loss, candidate, only_inputs=True)[0]
+            candidate = candidate.detach() - step_size * gradient.sign()
+            candidate = torch.maximum(torch.minimum(candidate, source + epsilon), source - epsilon)
+            candidate = candidate.clamp(0.0, 1.0)
+    if was_training:
+        model.train()
+    return candidate.detach()
+
+
 def _bilevel_weight_update(model, train_inputs, train_masks, validation_inputs,
                            validation_masks, alpha_logit, meta_optimizer,
-                           positive_weight, inner_step_size):
-    """One-step differentiable unrolled hypergradient update for WBCE/Dice alpha."""
+                           positive_weight, inner_step_size, clean_validation_inputs=None,
+                           clean_fpr_weight=0.25, validation_families=None):
+    """One-step unrolled hypergradient for robust IoU with a clean-FP penalty."""
     model.eval()  # Keep BatchNorm buffers fixed during the differentiable proxy step.
     parameters = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
@@ -312,10 +368,25 @@ def _bilevel_weight_update(model, train_inputs, train_masks, validation_inputs,
     validation_logits = functional_call(
         model, (updated_parameters, buffers), (validation_inputs,)
     )
-    validation_bce, validation_dice = _segmentation_components(
-        validation_logits, validation_masks, positive_weight
-    )
-    outer_objective = validation_bce + validation_dice
+    validation_probability = torch.sigmoid(validation_logits)
+    intersection = (validation_probability * validation_masks).sum(dim=(1, 2, 3))
+    denominator = validation_probability.sum(dim=(1, 2, 3)) + validation_masks.sum(dim=(1, 2, 3))
+    per_image_iou = (intersection + 1.0) / (denominator - intersection + 1.0)
+    if validation_families is None:
+        soft_iou = per_image_iou.mean()
+    else:
+        family_iou = [per_image_iou[
+            torch.as_tensor([family == candidate for family in validation_families],
+                            device=per_image_iou.device, dtype=torch.bool)
+        ].mean() for candidate in sorted(set(validation_families))]
+        soft_iou = torch.stack(family_iou).mean()
+    outer_objective = 1.0 - soft_iou
+    if clean_validation_inputs is not None:
+        clean_logits = functional_call(
+            model, (updated_parameters, buffers), (clean_validation_inputs,)
+        )
+        clean_fp_proxy = torch.sigmoid(clean_logits).mean()
+        outer_objective = outer_objective + clean_fpr_weight * clean_fp_proxy
     hypergradient = torch.autograd.grad(outer_objective, alpha_logit)[0]
     meta_optimizer.zero_grad(set_to_none=True)
     alpha_logit.grad = hypergradient.detach()
@@ -333,9 +404,15 @@ def _infer(model, loader, device):
         for batch in loader:
             if isinstance(batch, (list, tuple)):
                 batch = batch[0]
-            logits = model(batch.to(device, non_blocking=True))
-            maps.extend(torch.sigmoid(logits).squeeze(1).cpu().numpy())
+            probability, _ = _predict_batch(model, batch.to(device, non_blocking=True))
+            maps.extend(probability.squeeze(1).cpu().numpy())
     return maps
+
+
+def _predict_batch(model, inputs):
+    """Return per-pixel probabilities and pre-sigmoid max-logit image scores."""
+    logits = model(inputs)
+    return torch.sigmoid(logits), _image_scores_from_logits(logits)
 
 
 def _load_paths(paths: list[Path], image_size: int):
@@ -349,6 +426,26 @@ def _load_paths(paths: list[Path], image_size: int):
         except Exception as exc:
             print(f"Skipping unreadable/decode-failed image {path}: {type(exc).__name__}: {exc}")
     return records
+
+
+def calibrate_clean_image_threshold(model, validation_paths, image_size: int, *,
+                                    quantile: float = 99.0, device="cpu", batch_size=8):
+    """Calibrate legacy checkpoints with the current max-pre-sigmoid-logit score."""
+    if not 0.0 < quantile < 100.0:
+        raise ValueError("Image-score calibration quantile must be between 0 and 100.")
+    records = _load_paths([Path(path) for path in validation_paths], image_size)
+    if not records:
+        raise ValueError("No clean validation images are available for threshold calibration.")
+    target_device = torch.device(device)
+    model.to(target_device)
+    model.eval()
+    scores = []
+    with torch.no_grad():
+        for start in range(0, len(records), batch_size):
+            batch = torch.stack([item["image"] for item in records[start:start + batch_size]])[:, None]
+            logits = model(batch.to(target_device, non_blocking=True))
+            scores.extend(_image_scores_from_logits(logits).cpu().tolist())
+    return float(np.percentile(scores, quantile))
 
 
 def _binary_metrics(labels, predictions):
@@ -422,6 +519,61 @@ def _validation_localization_metrics(model, loader, device):
             "by_family": rows}
 
 
+def _robust_validation_metrics(model, attack_loader, clean_loader, device, *,
+                               epsilon=0.02, step_size=0.004, pgd_steps=10, seed=42):
+    """Evaluate synthetic masks before/after PGD and measure clean image scores."""
+    counts = {(family, condition): {"tp": 0, "fp": 0, "fn": 0, "images": 0}
+              for family in TRAIN_FAMILIES for condition in ("unattacked", "pgd10")}
+    model.eval()
+    with torch.no_grad():
+        for batch_index, (inputs, masks, families) in enumerate(attack_loader):
+            inputs = inputs.to(device, non_blocking=True)
+            truth_batch = masks[:, 0].bool().to(device)
+            logits = model(inputs)
+            probability = torch.sigmoid(logits)[:, 0]
+            pgd_inputs = _generate_pgd_evasion(
+                model, inputs, epsilon=epsilon, step_size=step_size, steps=pgd_steps,
+                seed=seed + batch_index, random_start=True,
+            )
+            with torch.no_grad():
+                pgd_probability = torch.sigmoid(model(pgd_inputs))[:, 0]
+            for index, family in enumerate(families):
+                for condition, prediction_map in (
+                    ("unattacked", probability[index] >= 0.5),
+                    ("pgd10", pgd_probability[index] >= 0.5),
+                ):
+                    item = counts[(family, condition)]
+                    truth = truth_batch[index]
+                    item["tp"] += int(torch.count_nonzero(truth & prediction_map))
+                    item["fp"] += int(torch.count_nonzero(~truth & prediction_map))
+                    item["fn"] += int(torch.count_nonzero(truth & ~prediction_map))
+                    item["images"] += 1
+
+    rows = []
+    for (family, condition), item in counts.items():
+        tp, fp, fn = item["tp"], item["fp"], item["fn"]
+        rows.append({"attack_family": family, "condition": condition,
+                     "n_images": item["images"],
+                     "pixel_iou": tp / (tp + fp + fn) if tp + fp + fn else 1.0,
+                     "pixel_dice": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 1.0,
+                     "pixel_precision": tp / (tp + fp) if tp + fp else 0.0,
+                     "pixel_recall": tp / (tp + fn) if tp + fn else 0.0})
+    clean_scores = []
+    with torch.no_grad():
+        for batch in clean_loader:
+            if isinstance(batch, (list, tuple)):
+                batch = batch[0]
+            logits = model(batch.to(device, non_blocking=True))
+            clean_scores.extend(_image_scores_from_logits(logits).cpu().tolist())
+    clean_threshold = float(np.percentile(clean_scores, 99.0))
+    clean_fpr = float(np.mean(np.asarray(clean_scores) >= clean_threshold))
+    return {"macro_pixel_iou": float(np.mean([row["pixel_iou"] for row in rows])),
+            "macro_pixel_dice": float(np.mean([row["pixel_dice"] for row in rows])),
+            "clean_image_fpr_at_q99": clean_fpr,
+            "clean_image_threshold_at_q99": clean_threshold,
+            "by_condition": rows}
+
+
 def _study_rows(frame: pd.DataFrame, threshold: float):
     study = frame.groupby("study_group", as_index=False).agg(
         label=("label", "max"), score=("image_score", "max"))
@@ -454,11 +606,14 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
                                 max_validation_attack_files=256, max_test_files=0,
                                 attack_fraction=0.20,
                                 pixel_quantile=99.5, image_quantile=99.0,
-                                base_channels=8, device_name="auto", architecture="unet",
+                                base_channels=24, device_name="auto", architecture="unet",
                                 loss_weighting="fixed", initial_bce_weight=0.5,
                                 alpha_learning_rate=1e-3,
                                 bilevel_meta_learning_rate=0.01,
-                                bilevel_inner_step_size=1e-3):
+                                bilevel_inner_step_size=1e-3,
+                                adversarial_training=False, positive_weight=3.0,
+                                adversarial_epsilon=0.02, adversarial_step_size=0.004,
+                                adversarial_steps=6, bilevel_update_interval=5):
     start_time = time.perf_counter()
     output = Path(output_dir).resolve()
     if output.exists() and any(output.iterdir()):
@@ -471,6 +626,12 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         raise ValueError("loss_weighting must be fixed, learnable, or bilevel.")
     if not 0.0 <= initial_bce_weight <= 1.0:
         raise ValueError("initial_bce_weight must be in [0, 1].")
+    if positive_weight <= 0 or adversarial_epsilon < 0 or adversarial_step_size <= 0:
+        raise ValueError("Positive weight and adversarial budgets must be valid positive values.")
+    if adversarial_steps < 1 or bilevel_update_interval < 1:
+        raise ValueError("Adversarial steps and bilevel update interval must be positive.")
+    if adversarial_training and batch_size < 3:
+        raise ValueError("Balanced clean/standard/PGD batches require --batch-size of at least 3.")
     output.mkdir(parents=True, exist_ok=True)
 
     random.seed(seed)
@@ -500,9 +661,11 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
     if not validation_images or not test_images:
         raise ValueError("No decodable single-frame images found after pixel decoding.")
 
-    train_dataset = SyntheticTrainingDataset(train_paths, image_size, seed)
+    train_dataset = (MixedAdversarialTrainingDataset(train_paths, image_size, seed)
+                     if adversarial_training else SyntheticTrainingDataset(train_paths, image_size, seed))
     train_generator = torch.Generator().manual_seed(seed + 7_919)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+    loader_batch_size = max(1, batch_size // 3) if adversarial_training else batch_size
+    train_loader = DataLoader(train_dataset, batch_size=loader_batch_size, shuffle=True,
                               num_workers=0, pin_memory=device.type == "cuda",
                               generator=train_generator)
     model = build_localizer(architecture=architecture, base_channels=base_channels).to(device)
@@ -527,6 +690,11 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         SyntheticValidationDataset(validation_attack_records, seed),
         batch_size=batch_size, shuffle=False, num_workers=0,
         pin_memory=device.type == "cuda")
+    selection_clean_tensor = (torch.stack([item["image"] for item in selection_validation_records])
+                              .unsqueeze(1))
+    selection_clean_loader = DataLoader(
+        TensorDataset(selection_clean_tensor), batch_size=batch_size, shuffle=False,
+        num_workers=0, pin_memory=device.type == "cuda")
     alpha_validation_records_for_meta = alpha_validation_records
     if max_validation_attack_files and len(alpha_validation_records_for_meta) > max_validation_attack_files:
         alpha_rng = random.Random(seed + 131_071)
@@ -535,8 +703,10 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         alpha_validation_records_for_meta = [alpha_validation_records_for_meta[index]
                                              for index in alpha_indices]
     validation_meta_loader = DataLoader(
-        SyntheticValidationDataset(alpha_validation_records_for_meta, seed),
-        batch_size=batch_size, shuffle=True, num_workers=0,
+        SyntheticValidationDataset(alpha_validation_records_for_meta, seed,
+                                   include_clean=adversarial_training),
+        batch_size=max(1, min(batch_size // 3, 4)) if adversarial_training else batch_size,
+        shuffle=True, num_workers=0,
         pin_memory=device.type == "cuda",
         generator=torch.Generator().manual_seed(seed + 15_827))
     history = []
@@ -545,6 +715,7 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
     best_validation_iou = -1.0
     best_validation_rows = None
     best_alpha = initial_bce_weight
+    best_validation_clean_fpr = float("inf")
     alpha_initial_logit = float(np.log(max(initial_bce_weight, 1e-6) /
                                        max(1.0 - initial_bce_weight, 1e-6)))
     alpha_logit = nn.Parameter(torch.tensor(alpha_initial_logit, device=device,
@@ -559,21 +730,63 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
     for epoch in range(epochs):
         train_dataset.set_epoch(epoch)
         model.train()
-        if loss_weighting == "bilevel":
-            validation_meta_batch = next(iter(validation_meta_loader))
-            validation_meta_inputs = validation_meta_batch[0].to(device, non_blocking=True)
-            validation_meta_masks = validation_meta_batch[1].to(device, non_blocking=True)
+        validation_meta_iterator = iter(validation_meta_loader)
         losses = []
         epoch_meta_validation = float("nan")
         epoch_hypergradient = float("nan")
-        for batch_index, (inputs, masks) in enumerate(train_loader):
-            inputs = inputs.to(device, non_blocking=True)
-            masks = masks.to(device, non_blocking=True)
-            if loss_weighting == "bilevel" and batch_index == 0:
+        for batch_index, batch_data in enumerate(train_loader):
+            if adversarial_training:
+                clean_inputs, standard_inputs, standard_masks = batch_data
+                clean_inputs = clean_inputs.to(device, non_blocking=True)
+                standard_inputs = standard_inputs.to(device, non_blocking=True)
+                standard_masks = standard_masks.to(device, non_blocking=True)
+                pgd_inputs = _generate_pgd_evasion(
+                    model, standard_inputs, epsilon=adversarial_epsilon,
+                    step_size=adversarial_step_size, steps=adversarial_steps,
+                    seed=seed + epoch * len(train_loader) + batch_index,
+                    random_start=True,
+                )
+                inputs = torch.cat([clean_inputs, standard_inputs, pgd_inputs], dim=0)
+                masks = torch.cat([
+                    torch.zeros_like(standard_masks), standard_masks, standard_masks,
+                ], dim=0)
+            else:
+                inputs, masks = batch_data
+                inputs = inputs.to(device, non_blocking=True)
+                masks = masks.to(device, non_blocking=True)
+
+            if (loss_weighting == "bilevel" and
+                    batch_index % bilevel_update_interval == 0):
+                try:
+                    validation_meta_batch = next(validation_meta_iterator)
+                except StopIteration:
+                    validation_meta_iterator = iter(validation_meta_loader)
+                    validation_meta_batch = next(validation_meta_iterator)
+                if adversarial_training:
+                    validation_clean = validation_meta_batch[0].to(device, non_blocking=True)
+                    validation_standard = validation_meta_batch[1].to(device, non_blocking=True)
+                    validation_masks = validation_meta_batch[2].to(device, non_blocking=True)
+                    validation_pgd = _generate_pgd_evasion(
+                        model, validation_standard, epsilon=adversarial_epsilon,
+                        step_size=adversarial_step_size, steps=10,
+                        seed=seed + 1_000_003 + epoch * len(train_loader) + batch_index,
+                        random_start=True,
+                    )
+                    validation_meta_inputs = torch.cat([validation_standard, validation_pgd], dim=0)
+                    validation_meta_masks = torch.cat([validation_masks, validation_masks], dim=0)
+                    family_batch = tuple(validation_meta_batch[3])
+                    validation_families = family_batch + family_batch
+                else:
+                    validation_meta_inputs = validation_meta_batch[0].to(device, non_blocking=True)
+                    validation_meta_masks = validation_meta_batch[1].to(device, non_blocking=True)
+                    validation_clean = None
+                    validation_families = None
                 _, epoch_meta_validation, epoch_hypergradient = _bilevel_weight_update(
                     model, inputs, masks, validation_meta_inputs, validation_meta_masks,
-                    alpha_logit, meta_optimizer, positive_weight=12.0,
+                    alpha_logit, meta_optimizer, positive_weight=positive_weight,
                     inner_step_size=bilevel_inner_step_size,
+                    clean_validation_inputs=validation_clean,
+                    validation_families=validation_families,
                 )
             optimizer.zero_grad(set_to_none=True)
             if alpha_optimizer is not None:
@@ -585,7 +798,7 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
                 alpha = torch.sigmoid(alpha_logit)
                 if loss_weighting == "bilevel":
                     alpha = alpha.detach()
-            bce, dice = _segmentation_components(logits, masks, positive_weight=12.0)
+            bce, dice = _segmentation_components(logits, masks, positive_weight=positive_weight)
             loss = alpha * bce + (1.0 - alpha) * dice
             loss.backward()
             optimizer.step()
@@ -600,7 +813,14 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         meta_validation_history.append(epoch_meta_validation)
         meta_gradient_history.append(epoch_hypergradient)
         mean_loss = float(np.mean(losses)) if losses else float("nan")
-        validation_metrics = _validation_localization_metrics(model, validation_attack_loader, device)
+        if adversarial_training:
+            validation_metrics = _robust_validation_metrics(
+                model, validation_attack_loader, selection_clean_loader, device,
+                epsilon=adversarial_epsilon, step_size=adversarial_step_size,
+                pgd_steps=10, seed=seed + 2_000_003 + epoch,
+            )
+        else:
+            validation_metrics = _validation_localization_metrics(model, validation_attack_loader, device)
         history_row = {"epoch": epoch + 1, "training_loss": mean_loss,
                        "bce_weight": learned_alpha,
                        "dice_weight": 1.0 - learned_alpha,
@@ -608,17 +828,29 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
                        "bilevel_hypergradient": epoch_hypergradient,
                        "validation_macro_pixel_dice": validation_metrics["macro_pixel_dice"],
                        "validation_macro_pixel_iou": validation_metrics["macro_pixel_iou"]}
-        for family_metrics in validation_metrics["by_family"]:
+        if adversarial_training:
+            history_row["validation_clean_image_fpr_q99"] = validation_metrics["clean_image_fpr_at_q99"]
+            history_row["validation_clean_image_threshold_q99"] = validation_metrics["clean_image_threshold_at_q99"]
+            validation_rows = validation_metrics["by_condition"]
+        else:
+            validation_rows = validation_metrics["by_family"]
+        for family_metrics in validation_rows:
             family = family_metrics["attack_family"]
-            history_row[f"validation_{family}_dice"] = family_metrics["pixel_dice"]
-            history_row[f"validation_{family}_iou"] = family_metrics["pixel_iou"]
+            condition = family_metrics.get("condition", "unattacked")
+            history_row[f"validation_{family}_{condition}_iou"] = family_metrics["pixel_iou"]
+            history_row[f"validation_{family}_{condition}_dice"] = family_metrics["pixel_dice"]
         history.append(history_row)
-        if validation_metrics["macro_pixel_iou"] > best_validation_iou:
+        clean_fpr_for_selection = validation_metrics.get("clean_image_fpr_at_q99", 0.0)
+        is_better = (validation_metrics["macro_pixel_iou"] > best_validation_iou or
+                     (np.isclose(validation_metrics["macro_pixel_iou"], best_validation_iou) and
+                      clean_fpr_for_selection < best_validation_clean_fpr))
+        if is_better:
             best_validation_iou = validation_metrics["macro_pixel_iou"]
+            best_validation_clean_fpr = clean_fpr_for_selection
             best_epoch = epoch + 1
             best_state = {key: value.detach().cpu().clone()
                           for key, value in model.state_dict().items()}
-            best_validation_rows = validation_metrics["by_family"]
+            best_validation_rows = validation_rows
             best_alpha = learned_alpha
         print(f"Epoch {epoch + 1}/{epochs}: train_loss={mean_loss:.5f}; "
               f"val_Dice={validation_metrics['macro_pixel_dice']:.4f}; "
@@ -642,12 +874,13 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
     model.eval()
     with torch.no_grad():
         for batch in val_loader:
-            probability_batch = torch.sigmoid(model(batch.to(device, non_blocking=True))).squeeze(1).cpu().numpy()
-            for probability in probability_batch:
+            probability_tensor, image_scores = _predict_batch(model, batch.to(device, non_blocking=True))
+            probability_batch = probability_tensor.squeeze(1).cpu().numpy()
+            for probability, image_score in zip(probability_batch, image_scores.cpu().numpy()):
                 flat = np.asarray(probability, dtype=np.float32).ravel()
                 sample_size = min(2048, len(flat))
                 val_pixel_samples.extend(flat[rng.choice(len(flat), sample_size, replace=False)].tolist())
-                val_image_scores.append(float(np.max(probability)))
+                val_image_scores.append(float(image_score))
     pixel_threshold = float(np.percentile(val_pixel_samples, pixel_quantile))
     image_threshold = float(np.percentile(val_image_scores, image_quantile))
 
@@ -668,9 +901,10 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         for start in range(0, len(test_images), batch_size):
             batch_items = test_images[start:start + batch_size]
             batch = torch.stack([item["image"] for item in batch_items])[:, None]
-            probability_batch = torch.sigmoid(model(batch.to(device, non_blocking=True))).squeeze(1).cpu().numpy()
-            for item, probability in zip(batch_items, probability_batch):
-                image_score = float(np.max(probability))
+            probability_tensor, image_scores = _predict_batch(model, batch.to(device, non_blocking=True))
+            probability_batch = probability_tensor.squeeze(1).cpu().numpy()
+            for item, probability, image_score_value in zip(batch_items, probability_batch, image_scores.cpu().numpy()):
+                image_score = float(image_score_value)
                 clean_image_rows.append({
                     "condition": "clean", "attack_family": "none", "file": relative_key(item["path"], test_dir),
                     "study_group": item["study_group"], "label": 0, "image_score": image_score,
@@ -707,12 +941,14 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
                 truth_batch.append(truth)
                 label_batch.append(label)
             with torch.no_grad():
-                probability_batch = torch.sigmoid(model(
-                    torch.stack(edited_batch)[:, None].to(device, non_blocking=True)
-                )).squeeze(1).cpu().numpy()
-            for item, edited, truth, label, probability in zip(
-                    batch_items, edited_batch, truth_batch, label_batch, probability_batch):
-                image_score = float(np.max(probability))
+                probability_tensor, image_scores = _predict_batch(
+                    model, torch.stack(edited_batch)[:, None].to(device, non_blocking=True)
+                )
+                probability_batch = probability_tensor.squeeze(1).cpu().numpy()
+                image_scores = image_scores.cpu().numpy()
+            for item, edited, truth, label, probability, image_score_value in zip(
+                    batch_items, edited_batch, truth_batch, label_batch, probability_batch, image_scores):
+                image_score = float(image_score_value)
                 image_prediction = int(image_score >= image_threshold)
                 predicted_mask = probability >= pixel_threshold
                 labels.append(label)
@@ -767,6 +1003,7 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         "config": {"image_size": image_size, "base_channels": base_channels,
                    "architecture": architecture,
                    "pixel_threshold": pixel_threshold, "image_threshold": image_threshold,
+                   "image_score_type": "maximum_pre_sigmoid_logit",
                    "pixel_quantile": pixel_quantile, "image_quantile": image_quantile,
                    "seed": seed, "train_families": list(TRAIN_FAMILIES),
                    "withheld_test_family": "copy_move_unseen"},
@@ -786,11 +1023,19 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
         "epochs_requested": epochs, "epochs_completed": len(history),
         "best_epoch_selected_by_validation_macro_pixel_iou": best_epoch,
         "best_validation_macro_pixel_iou": best_validation_iou,
+        "best_validation_clean_image_fpr_at_q99": best_validation_clean_fpr,
         "validation_attack_images": len(validation_attack_records),
         "validation_metric_threshold": 0.5,
         "batch_size": batch_size, "base_channels": base_channels,
         "architecture": architecture,
         "loss_weighting": loss_weighting,
+        "adversarial_training": bool(adversarial_training),
+        "positive_pixel_bce_weight": positive_weight,
+        "adversarial_epsilon_linf": adversarial_epsilon if adversarial_training else None,
+        "adversarial_step_size": adversarial_step_size if adversarial_training else None,
+        "adversarial_training_steps": adversarial_steps if adversarial_training else None,
+        "bilevel_update_interval_batches": bilevel_update_interval if loss_weighting == "bilevel" else None,
+        "image_score_type": "maximum_pre_sigmoid_logit",
         "initial_bce_weight": initial_bce_weight,
         "selected_bce_weight": best_alpha,
         "selected_dice_weight": 1.0 - best_alpha,
@@ -818,9 +1063,9 @@ def run_supervised_localization(train_dir, validation_dir, test_dir, output_dir,
     report = [
         "# Supervised DICOM pixel-tamper localization", "",
         f"The {architecture} model is trained to segment synthetic pixel edits. The model receives each image independently; it does not receive a clean counterpart or a hash reference at inference time.",
-        f"The compound segmentation loss is {best_alpha:.4f} WBCE + {1.0 - best_alpha:.4f} Dice at the selected checkpoint (positive-pixel BCE weight remains 12). Weighting mode: {loss_weighting}.",
+        f"The compound segmentation loss is {best_alpha:.4f} WBCE + {1.0 - best_alpha:.4f} Dice at the selected checkpoint (positive-pixel BCE weight {positive_weight:g}). Weighting mode: {loss_weighting}.",
         "Training edit families are localized patches and sparse low-amplitude changes. The copy-move family is withheld from training and evaluated as a synthetic out-of-family condition.",
-        "Thresholds are calibrated using clean validation images only. For study-disjoint adaptive weighting, validation studies are split into coefficient-update and checkpoint-selection/calibration groups; the test fold is untouched. Bilevel mode uses a one-inner-step differentiable hypergradient approximation once per epoch. Pixel masks are resized to the model grid before evaluation; they are not native-resolution clinical annotations.", "",
+        "The image-level alarm score is the maximum pre-sigmoid logit, avoiding probability saturation. Thresholds are calibrated using clean validation images only. For study-disjoint adaptive weighting, validation studies are split into coefficient-update and checkpoint-selection/calibration groups; the test fold is untouched. Bilevel mode uses a one-inner-step differentiable hypergradient approximation. Adversarial mode balances clean, standard synthetic, and live PGD-evaded samples in each update; PGD inputs are generated with BatchNorm in evaluation mode and are trained against their original tamper masks. The validation-selected checkpoint maximizes mean pixel IoU across unattacked and 10-step PGD validation edits, with clean q99 false-alarm rate as the tie-break. Pixel masks are resized to the model grid before evaluation; they are not native-resolution clinical annotations.", "",
         f"- Train images: {len(train_paths)} (cap={max_train_files or 'all'})",
         f"- Validation images: {len(validation_images)}",
         f"- Test images: {len(test_images)} across {len(study_ids)} studies",

@@ -9,6 +9,24 @@ import pydicom
 from .manifest import verify_signed_manifest
 
 
+def _image_threshold_for_checkpoint(model, config: dict) -> tuple[float, str]:
+    """Read the configured score, recalibrating legacy probability thresholds when possible."""
+    score_type = config.get("image_score_type")
+    if score_type == "maximum_pre_sigmoid_logit":
+        return float(config.get("image_threshold", 0.0)), score_type
+    validation_dir = Path(__file__).resolve().parents[2] / "data" / "cpaisd" / "val"
+    if validation_dir.is_dir():
+        from ..dicom_io import find_dicom_files
+        from ..supervised_localization import calibrate_clean_image_threshold
+        paths = find_dicom_files(validation_dir)
+        if paths:
+            threshold = calibrate_clean_image_threshold(
+                model, paths, int(config.get("image_size", 256)), quantile=99.0,
+            )
+            return threshold, "maximum_pre_sigmoid_logit"
+    return float(config.get("image_threshold", 1.0)), "legacy_max_probability"
+
+
 def verify_then_analyze(dicom_path: str | Path, manifest_path: str | Path,
                         trust_registry_path: str | Path, *, if_model_path: str | Path | None = None,
                         autoencoder_model_path: str | Path | None = None,
@@ -99,12 +117,11 @@ def verify_then_analyze(dicom_path: str | Path, manifest_path: str | Path,
 
     if unet_checkpoint_path and Path(unet_checkpoint_path).is_file():
         try:
-            from ..supervised_localization import AttentionUNetLocalizer, UNetLocalizer
+            from ..supervised_localization import build_localizer
             checkpoint = torch.load(unet_checkpoint_path, map_location="cpu", weights_only=True)
             config = checkpoint.get("config", {})
             architecture = config.get("architecture", "unet")
-            model_class = AttentionUNetLocalizer if architecture == "attention_unet" else UNetLocalizer
-            model = model_class(base_channels=int(config.get("base_channels", 8)))
+            model = build_localizer(architecture, base_channels=int(config.get("base_channels", 24)))
             model.load_state_dict(checkpoint["state_dict"])
             model.eval()
             image = _normalized_image(ds)
@@ -112,13 +129,19 @@ def verify_then_analyze(dicom_path: str | Path, manifest_path: str | Path,
             tensor = F.interpolate(tensor, size=(int(config.get("image_size", 256)),) * 2,
                                    mode="bilinear", align_corners=False)
             with torch.no_grad():
-                probability = torch.sigmoid(model(tensor))[0, 0].numpy()
+                logits = model(tensor)
+                probability = torch.sigmoid(logits)[0, 0].numpy()
+                image_score = float(logits.flatten(start_dim=1).amax(dim=1)[0].item())
             pixel_threshold = float(config.get("pixel_threshold", 0.5))
-            image_threshold = float(config.get("image_threshold", 1.0))
+            image_threshold, image_score_type = _image_threshold_for_checkpoint(model, config)
             mask = probability >= pixel_threshold
-            result["segmentation"] = {"status": "COMPLETED", "flag": int(float(probability.max()) >= image_threshold),
+            if image_score_type != "maximum_pre_sigmoid_logit":
+                image_score = float(probability.max())
+            result["segmentation"] = {"status": "COMPLETED", "flag": int(image_score >= image_threshold),
                                       "architecture": architecture,
-                                      "max_probability": float(probability.max()), "image_threshold": image_threshold,
+                                      "image_score": image_score,
+                                      "image_score_type": image_score_type,
+                                      "image_threshold": image_threshold,
                                       "pixel_threshold": pixel_threshold, "mask": mask_summary(mask),
                                       "model_input_size": list(probability.shape)}
         except Exception as exc:
@@ -253,26 +276,31 @@ def verify_directory_then_analyze(dicom_root: str | Path, manifest_root: str | P
 
     if unet_checkpoint_path and Path(unet_checkpoint_path).is_file():
         try:
-            from ..supervised_localization import AttentionUNetLocalizer, UNetLocalizer
+            from ..supervised_localization import build_localizer
             checkpoint = torch.load(unet_checkpoint_path, map_location="cpu", weights_only=True)
             config = checkpoint.get("config", {})
             architecture = config.get("architecture", "unet")
-            model_class = AttentionUNetLocalizer if architecture == "attention_unet" else UNetLocalizer
-            model = model_class(base_channels=int(config.get("base_channels", 8)))
+            model = build_localizer(architecture, base_channels=int(config.get("base_channels", 24)))
             model.load_state_dict(checkpoint["state_dict"]); model.eval()
             image_size = int(config.get("image_size", 256))
             pixel_threshold = float(config.get("pixel_threshold", 0.5))
-            image_threshold = float(config.get("image_threshold", 1.0))
+            image_threshold, image_score_type = _image_threshold_for_checkpoint(model, config)
             for token, ds, _ in verified_items:
                 image = _normalized_image(ds)
                 tensor = torch.from_numpy(np.asarray(image, dtype=np.float32))[None, None]
                 tensor = F.interpolate(tensor, size=(image_size, image_size), mode="bilinear", align_corners=False)
                 with torch.no_grad():
-                    probability = torch.sigmoid(model(tensor))[0, 0].numpy()
+                    logits = model(tensor)
+                    probability = torch.sigmoid(logits)[0, 0].numpy()
+                    image_score = float(logits.flatten(start_dim=1).amax(dim=1)[0].item())
                 mask = probability >= pixel_threshold
+                if image_score_type != "maximum_pre_sigmoid_logit":
+                    image_score = float(probability.max())
                 records[token]["segmentation"] = {"status": "COMPLETED", "architecture": architecture,
-                    "flag": int(float(probability.max()) >= image_threshold),
-                    "max_probability": float(probability.max()), "image_threshold": image_threshold,
+                    "flag": int(image_score >= image_threshold),
+                    "image_score": image_score,
+                    "image_score_type": image_score_type,
+                    "image_threshold": image_threshold,
                     "pixel_threshold": pixel_threshold, "mask": mask_summary(mask),
                     "model_input_size": list(probability.shape)}
         except Exception as exc:

@@ -476,6 +476,45 @@ Setup: the trained U-Net, no retraining. Targeted white-box attack minimizing BC
 
 Meaning: this checkpoint is highly evadable by a small targeted white-box perturbation. Not shown: that such perturbations are clinically plausible, survive serialization back into DICOM/HU, or transfer to other detectors. An exact-reference PixelData hash would still catch the serialized change.
 
+### 12.1 Bilevel online-PGD training (new pipeline; full run pending)
+
+The earlier evaluator used `max(sigmoid(logits))` for image-level alerts. With
+large positive logits, this can round to exactly `1.0`, making the clean q99
+threshold uninformative. The updated pipeline calibrates and evaluates image
+alarms using the **maximum pre-sigmoid logit**; pixel masks still use sigmoid
+probabilities. The paired runner recalibrates both the original baseline and
+the new checkpoint on the same clean validation fold.
+
+The new training mode uses the full 8,376-image training fold by default and a
+24-channel base width. Each batch has equal clean, standard synthetic, and
+online PGD-evaded images. Training PGD uses random start, 6 steps, `epsilon =
+0.02`, and step size `0.004`; batch-normalization layers remain in evaluation
+mode while generating the attack. The evasion objective targets an all-clean
+mask, while the model is trained on the original tamper mask. WBCE/Dice mixing
+is updated by Adam every five batches using a one-step hypergradient and
+held-out validation clean, synthetic, and 10-step PGD examples. Checkpoint
+selection maximizes validation macro IoU across unattacked and PGD edits, with
+clean q99 FPR used to break IoU ties. Copy-move remains held out.
+
+Run the full experiment and paired baseline comparison:
+
+```powershell
+python scripts/run_bilevel_adversarial_unet.py `
+  --train data/cpaisd/train `
+  --validation data/cpaisd/val `
+  --test data/cpaisd/test `
+  --baseline-checkpoint experiment_cpaisd_supervised_localization_512_30ep_complete/unet_localizer.pt `
+  --output experiment_cpaisd_bilevel_adversarial_unet
+```
+
+The paired evaluator uses up to 64 positive files per edit family by default;
+use `--max-eval-images-per-family 0` to evaluate all selected positives. For a
+short pipeline smoke run, use `--epochs 1 --base-width 8 --max-train-files 18
+--max-validation-files 100 --max-validation-attack-files 16
+--max-test-files 40 --max-eval-images-per-family 2` and a fresh output path.
+Smoke-run metrics are not research results. A full adversarial run was not
+completed when this section was added, so no robustness improvement is claimed.
+
 ---
 
 ## 13. Benign-change controls
@@ -589,6 +628,7 @@ Common settings: seed 42, 20% study attack fraction, CPU runs.
 | 30-epoch U-Net | 512 capped train images, batch 8, 256×256, about 49 min (2,946 s), epoch 30 selected |
 | Attention U-Net | same setup, epoch 28 selected |
 | FGSM/PGD | eps 0.02, 10 PGD steps, step 0.004; 236 / 152 / 139 positive images |
+| Bilevel online-PGD U-Net | full 8,376 train images, width 24, balanced batches, 6-step train PGD, Adam hypergradient every 5 batches; full run pending |
 | Combined run | metadata seed 42, pixel seed 44, 310 unique positives |
 
 Output folders named in the paper:

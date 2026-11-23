@@ -1,0 +1,4 @@
+condition,n_studies,accuracy,precision,recall,f1,specificity,false_positive_rate,tn,fp,fn,tp
+localized_patch,10,0.8,0.0,0.0,0.0,1.0,0.0,8,0,2,0
+sparse_low_amplitude,10,0.8,0.0,0.0,0.0,1.0,0.0,8,0,2,0
+copy_move_unseen,10,0.8,0.0,0.0,0.0,1.0,0.0,8,0,2,0

@@ -36,7 +36,7 @@ def main():
                         help="Clean-validation pixel-score quantile for mask threshold")
     parser.add_argument("--image-quantile", type=float, default=99.0,
                         help="Clean-validation per-image maximum-score quantile")
-    parser.add_argument("--base-channels", type=int, default=8)
+    parser.add_argument("--base-channels", type=int, default=24)
     parser.add_argument("--architecture", choices=["unet", "attention_unet"], default="unet",
                         help="Model architecture; use attention_unet for attention-gated skip connections")
     parser.add_argument("--loss-weighting", choices=["fixed", "learnable", "bilevel"],
@@ -49,6 +49,15 @@ def main():
                         help="Adam learning rate for bilevel hypergradient updates")
     parser.add_argument("--bilevel-inner-step-size", type=float, default=1e-3,
                         help="One-step SGD proxy step used to compute the unrolled hypergradient")
+    parser.add_argument("--adversarial-training", action="store_true",
+                        help="Balance clean, standard-edit, and live PGD-evasion samples in every training update")
+    parser.add_argument("--positive-weight", type=float, default=3.0,
+                        help="Positive-pixel BCE weight")
+    parser.add_argument("--adversarial-epsilon", type=float, default=0.02)
+    parser.add_argument("--adversarial-step-size", type=float, default=0.004)
+    parser.add_argument("--adversarial-steps", type=int, default=6)
+    parser.add_argument("--bilevel-update-interval", type=int, default=5,
+                        help="Update WBCE/Dice lambda every K batches")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or another torch device")
     args = parser.parse_args()
 
@@ -67,6 +76,12 @@ def main():
         alpha_learning_rate=args.alpha_learning_rate,
         bilevel_meta_learning_rate=args.bilevel_meta_learning_rate,
         bilevel_inner_step_size=args.bilevel_inner_step_size,
+        adversarial_training=args.adversarial_training,
+        positive_weight=args.positive_weight,
+        adversarial_epsilon=args.adversarial_epsilon,
+        adversarial_step_size=args.adversarial_step_size,
+        adversarial_steps=args.adversarial_steps,
+        bilevel_update_interval=args.bilevel_update_interval,
     )
     print(summary.to_string(index=False))
     print(f"\nSaved: {Path(args.output).resolve()}")

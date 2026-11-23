@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 from src.dicom_io import find_dicom_files, relative_key
 from src.supervised_localization import (
     TEST_FAMILIES,
+    _image_scores_from_logits,
     build_localizer,
     _apply_test_edit,
     _load_paths,
@@ -132,7 +133,9 @@ def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fracti
                    epsilon=0.02, pgd_steps=10, pgd_step_size=0.004,
                    cw_steps=20, cw_learning_rate=0.01, cw_constant=1.0,
                    l2_radius=2.0, deepfool_steps=10,
-                   max_images_per_family=64, device_name="cpu"):
+                   max_images_per_family=64, device_name="cpu",
+                   validation_dir="data/cpaisd/val", image_quantile=99.0,
+                   attack_methods=("baseline", "fgsm", "pgd")):
     output_dir = Path(output_dir)
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"Output directory is not empty; choose a fresh path: {output_dir}")
@@ -143,8 +146,13 @@ def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fracti
             or cw_learning_rate <= 0 or cw_constant <= 0 or l2_radius <= 0
             or deepfool_steps < 1 or max_images_per_family < 0):
         raise ValueError("Invalid attack budget or optimization parameters.")
+    allowed_methods = {"baseline", "fgsm", "bim", "pgd", "cw_l2", "deepfool_l2"}
+    attack_methods = tuple(dict.fromkeys(attack_methods))
+    if "baseline" not in attack_methods or any(method not in allowed_methods for method in attack_methods):
+        raise ValueError("Attack methods must include baseline and use supported method names.")
 
-    device = torch.device(device_name)
+    device = (torch.device("cuda") if device_name == "auto" and torch.cuda.is_available()
+              else torch.device("cpu") if device_name == "auto" else torch.device(device_name))
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
     model = build_localizer(config.get("architecture", "unet"),
@@ -154,7 +162,16 @@ def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fracti
     model.requires_grad_(False)
     image_size = int(config["image_size"])
     pixel_threshold = float(config["pixel_threshold"])
-    image_threshold = float(config["image_threshold"])
+    validation_records = _load_paths(find_dicom_files(Path(validation_dir)), image_size)
+    if not validation_records:
+        raise ValueError("No clean validation images could be decoded for image-score calibration.")
+    clean_validation_scores = []
+    with torch.no_grad():
+        for start in range(0, len(validation_records), 8):
+            batch = torch.stack([item["image"] for item in validation_records[start:start + 8]])[:, None]
+            logits = model(batch.to(device))
+            clean_validation_scores.extend(_image_scores_from_logits(logits).cpu().tolist())
+    image_threshold = float(np.percentile(clean_validation_scores, image_quantile))
 
     records = _load_paths(find_dicom_files(Path(test_dir)), image_size)
     study_ids = sorted({record["study_group"] for record in records})
@@ -166,7 +183,20 @@ def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fracti
 
     rows = []
     summary_rows = []
-    methods = ("baseline", "fgsm", "bim", "pgd", "cw_l2", "deepfool_l2")
+    methods = attack_methods
+    clean_test_scores = []
+    with torch.no_grad():
+        for start in range(0, len(records), 8):
+            batch = torch.stack([item["image"] for item in records[start:start + 8]])[:, None]
+            logits = model(batch.to(device))
+            clean_test_scores.extend(_image_scores_from_logits(logits).cpu().tolist())
+    clean_frame = pd.DataFrame({
+        "study_group": [item["study_group"] for item in records],
+        "image_score": clean_test_scores,
+    })
+    clean_file_fpr = float(np.mean(np.asarray(clean_test_scores) >= image_threshold))
+    clean_study_scores = clean_frame.groupby("study_group")["image_score"].max().to_numpy()
+    clean_study_fpr = float(np.mean(clean_study_scores >= image_threshold))
     for family_index, family in enumerate(TEST_FAMILIES):
         examples = []
         for index, record in enumerate(records):
@@ -183,30 +213,34 @@ def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fracti
                           "tp": 0, "fp": 0, "fn": 0, "tn": 0}
                  for method in methods}
         for example_index, (record, edited, truth) in enumerate(examples):
-            attack_images = {
-                "baseline": edited,
-                "fgsm": _attack_evasion(model, edited, epsilon, "fgsm", 1,
-                                          epsilon, seed + example_index, device),
-                "bim": _attack_evasion(model, edited, epsilon, "bim", pgd_steps,
-                                        pgd_step_size, seed + example_index, device),
-                "pgd": _attack_evasion(model, edited, epsilon, "pgd", pgd_steps,
-                                        pgd_step_size, seed + example_index, device),
-                "cw_l2": _cw_l2_evasion(model, edited, steps=cw_steps,
-                                         learning_rate=cw_learning_rate,
-                                         constant=cw_constant, l2_radius=l2_radius,
-                                         device=device),
-                "deepfool_l2": _deepfool_l2_evasion(model, edited,
-                                                      max_steps=deepfool_steps,
-                                                      l2_radius=l2_radius,
-                                                      device=device),
-            }
+            attack_images = {"baseline": edited}
+            if "fgsm" in methods:
+                attack_images["fgsm"] = _attack_evasion(
+                    model, edited, epsilon, "fgsm", 1, epsilon, seed + example_index, device)
+            if "bim" in methods:
+                attack_images["bim"] = _attack_evasion(
+                    model, edited, epsilon, "bim", pgd_steps, pgd_step_size,
+                    seed + example_index, device)
+            if "pgd" in methods:
+                attack_images["pgd"] = _attack_evasion(
+                    model, edited, epsilon, "pgd", pgd_steps, pgd_step_size,
+                    seed + example_index, device)
+            if "cw_l2" in methods:
+                attack_images["cw_l2"] = _cw_l2_evasion(
+                    model, edited, steps=cw_steps, learning_rate=cw_learning_rate,
+                    constant=cw_constant, l2_radius=l2_radius, device=device)
+            if "deepfool_l2" in methods:
+                attack_images["deepfool_l2"] = _deepfool_l2_evasion(
+                    model, edited, max_steps=deepfool_steps,
+                    l2_radius=l2_radius, device=device)
             truth_mask = truth.to(device=device, dtype=torch.bool)
             baseline_alarm = None
             file_id = hashlib.sha256(relative_key(record["path"], Path(test_dir)).encode()).hexdigest()[:16]
             for method, image in attack_images.items():
                 with torch.no_grad():
-                    probability = torch.sigmoid(model(image.to(device).unsqueeze(0).unsqueeze(0)))[0, 0]
-                score = float(probability.max().item())
+                    logits = model(image.to(device).unsqueeze(0).unsqueeze(0))
+                    probability = torch.sigmoid(logits)[0, 0]
+                    score = float(_image_scores_from_logits(logits)[0].item())
                 prediction = int(score >= image_threshold)
                 if method == "baseline":
                     baseline_alarm = bool(prediction)
@@ -247,8 +281,13 @@ def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fracti
                 "detected_images": item["detected"],
                 "pixel_precision": precision, "pixel_recall": recall,
                 "pixel_iou": tp / (tp + fp + fn) if tp + fp + fn else 0.0,
-                "attack_success_rate": item["success"] / max(1, item["baseline_detected"])
-                    if method != "baseline" else 0.0,
+                "attack_success_rate": (
+                    item["success"] / item["baseline_detected"]
+                    if method != "baseline" and item["baseline_detected"] else
+                    float("nan") if method != "baseline" else 0.0
+                ),
+                "clean_test_file_fpr": clean_file_fpr,
+                "clean_test_study_fpr": clean_study_fpr,
             })
         print(f"Completed {family}: evaluated {len(examples)} of {candidate_count} positive images.",
               flush=True)
@@ -270,7 +309,10 @@ def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fracti
             "deepfool_l2": {"norm": "L2", "radius": l2_radius, "max_steps": deepfool_steps},
         },
         "device": str(device), "image_threshold": image_threshold,
-        "pixel_threshold": pixel_threshold,
+        "image_score_type": "maximum_pre_sigmoid_logit",
+        "image_quantile": image_quantile, "validation_images_for_calibration": len(validation_records),
+        "clean_test_file_fpr": clean_file_fpr, "clean_test_study_fpr": clean_study_fpr,
+        "pixel_threshold": pixel_threshold, "attack_methods": list(methods),
         "objective": "targeted evasion: minimize BCE-with-logits against an all-clean mask",
         "scope": "balanced synthetic edited image subset only; L-infinity and L2 budgets are different and not directly equivalent",
     }
@@ -280,9 +322,10 @@ def run_evaluation(checkpoint_path, test_dir, output_dir, seed=42, attack_fracti
         f"- Test studies: {len(study_ids)}", f"- Positive studies per edit family: {positives_per_condition}",
         f"- Maximum evaluated images per edit family: {max_images_per_family or 'all selected positives'}",
         f"- L-infinity budget in normalized image units: {epsilon}",
-        f"- FGSM/BIM/PGD L-infinity budget: {epsilon}; BIM/PGD steps / step size: {pgd_steps} / {pgd_step_size}",
-        f"- C&W-style L2 radius / optimization steps: {l2_radius} / {cw_steps}",
-        f"- DeepFool-style L2 radius / maximum steps: {l2_radius} / {deepfool_steps}",
+        f"- Image score: max pre-sigmoid logit; clean validation calibration quantile: {image_quantile}",
+        f"- Clean test image FPR: {clean_file_fpr:.4f}; clean test study FPR: {clean_study_fpr:.4f}",
+        f"- Methods evaluated: {', '.join(methods)}",
+        f"- FGSM/BIM/PGD budget: L-infinity epsilon {epsilon}; iterative steps / step size {pgd_steps} / {pgd_step_size}",
         "- Attacks target suppression of the U-Net tamper response; attack success is reported only among synthetic edited images detected by the baseline model.",
         "- The L-infinity and L2 attacks have different constraints and should not be interpreted as equal-budget comparisons.",
         "- These attacks test the U-Net only. Any changed DICOM PixelData would still differ from an exact clean reference hash.",
@@ -312,6 +355,11 @@ def main():
     parser.add_argument("--deepfool-steps", type=int, default=10)
     parser.add_argument("--max-images-per-family", type=int, default=64,
                         help="Balanced, deterministic subset cap across selected studies; zero uses all positives")
+    parser.add_argument("--validation", default="data/cpaisd/val",
+                        help="Clean validation fold used to recalibrate max-logit image threshold")
+    parser.add_argument("--image-quantile", type=float, default=99.0)
+    parser.add_argument("--attack-methods", default="baseline,fgsm,pgd",
+                        help="Comma-separated methods: baseline,fgsm,bim,pgd,cw_l2,deepfool_l2")
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
     result = run_evaluation(args.checkpoint, args.test, args.output, args.seed,
@@ -319,7 +367,8 @@ def main():
                             args.pgd_step_size, args.cw_steps, args.cw_learning_rate,
                             args.cw_constant, args.l2_radius, args.deepfool_steps,
                             args.max_images_per_family,
-                            args.device)
+                            args.device, args.validation, args.image_quantile,
+                            tuple(method.strip() for method in args.attack_methods.split(",") if method.strip()))
     print(result.to_string(index=False))
     print(f"\nAdversarial attack comparison saved: {Path(args.output).resolve()}")
 

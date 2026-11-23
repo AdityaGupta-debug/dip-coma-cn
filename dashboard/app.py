@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import random
+import subprocess
 import shutil
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import joblib
@@ -31,6 +33,15 @@ from src.no_reference_pixel import (
 from src.pixel_integrity import _edit_pixels
 from src.pixel_metadata_consistency import check_pixel_metadata_consistency
 from src.semantic_consistency import validate_semantic_consistency
+from src.security.audit import append_audit_event
+from src.security.canonical import canonical_json_bytes, raw_file_sha256
+from src.security.manifest import create_signed_manifest, save_signed_manifest, verify_signed_manifest
+from src.security.privacy import (decrypt_file, deidentify_research_copy, encrypt_file,
+                                  generate_aes256_key)
+from src.security.signing import (add_trusted_signer, generate_ed25519_keypair,
+                                  generate_hmac_key, hmac_sha256, key_id_for_public_key,
+                                  load_public_key, revoke_trusted_signer, verify_hmac_sha256)
+from src.security.workflow import verify_directory_then_analyze, verify_then_analyze
 
 
 DATASET_DIR = PROJECT_ROOT / "data" / "cpaisd" / "test"
@@ -38,6 +49,13 @@ IF_MODEL = PROJECT_ROOT / "experiment_cpaisd" / "models" / "isolation_forest.job
 AE_MODEL = PROJECT_ROOT / "experiment_cpaisd" / "models" / "metadata_autoencoder.joblib"
 PIXEL_MODEL = PROJECT_ROOT / "experiment_cpaisd_no_reference_v2" / "no_reference_pixel_model.joblib"
 PIXEL_CALIBRATION = PROJECT_ROOT / "experiment_cpaisd_no_reference_v2" / "calibration_and_clean_summary.json"
+SECURITY_HOME = Path.home() / ".dicom_security_demo"
+SECURITY_KEYS = SECURITY_HOME / "keys"
+SECURITY_TRUST_REGISTRY = SECURITY_HOME / "trusted-senders.json"
+SECURITY_REPLAY_CACHE = SECURITY_HOME / "accepted-manifests.json"
+SECURITY_UI_OUTPUT = PROJECT_ROOT / "reports" / "security_ui"
+SECURITY_AUDIT_LOG = SECURITY_UI_OUTPUT / "security_audit.jsonl"
+SECURITY_EXPERIMENT_OUTPUT = PROJECT_ROOT / "reports" / "crypto_security_full"
 _completed_unet = (PROJECT_ROOT / "experiment_cpaisd_supervised_localization_512_30ep_complete"
                   / "unet_localizer.pt")
 _unet_candidates = sorted(
@@ -79,13 +97,22 @@ def load_pixel_bundle(path_string: str):
 @st.cache_resource(show_spinner="Loading the supervised pixel-localization model...")
 def load_unet_bundle(path_string: str):
     import torch
-    from src.supervised_localization import UNetLocalizer
+    from src.supervised_localization import build_localizer, calibrate_clean_image_threshold
 
     checkpoint = torch.load(path_string, map_location="cpu", weights_only=True)
     config = checkpoint["config"]
-    model = UNetLocalizer(base_channels=int(config["base_channels"]))
+    model = build_localizer(config.get("architecture", "unet"),
+                            base_channels=int(config["base_channels"]))
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
+    if config.get("image_score_type") != "maximum_pre_sigmoid_logit":
+        validation_paths = find_dicom_files(PROJECT_ROOT / "data" / "cpaisd" / "val")
+        if validation_paths:
+            config["image_threshold"] = calibrate_clean_image_threshold(
+                model, validation_paths, int(config["image_size"]), quantile=99.0,
+            )
+            config["image_score_type"] = "maximum_pre_sigmoid_logit"
+            config["image_quantile"] = 99.0
     return model, config
 
 
@@ -99,9 +126,13 @@ def unet_probability_map(dataset, model, config):
     tensor = functional.interpolate(tensor, size=(image_size, image_size),
                                     mode="bilinear", align_corners=False)
     with torch.no_grad():
-        probability = torch.sigmoid(model(tensor))[0, 0].cpu().numpy()
+        logits = model(tensor)
+        probability = torch.sigmoid(logits)[0, 0].cpu().numpy()
+        image_score = float(logits.flatten(start_dim=1).amax(dim=1)[0].item())
+    if config.get("image_score_type") != "maximum_pre_sigmoid_logit":
+        image_score = float(probability.max())
     pixel_mask = probability >= float(config["pixel_threshold"])
-    return normalized, probability, pixel_mask
+    return normalized, probability, pixel_mask, image_score
 
 
 def apply_copy_move_edit(path: Path, seed: int = 42) -> tuple[int, np.ndarray]:
@@ -320,20 +351,18 @@ def run_live_demo(source_file: Path, edit_mode: str, metadata_edit: str | None,
         unet_outputs = None
         if UNET_MODEL.is_file():
             unet_model, unet_config = load_unet_bundle(str(UNET_MODEL))
-            clean_norm_unet, clean_probability, clean_unet_mask = unet_probability_map(
+            clean_norm_unet, clean_probability, clean_unet_mask, clean_score = unet_probability_map(
                 clean_ds, unet_model, unet_config
             )
-            edited_norm_unet, edited_probability, edited_unet_mask = unet_probability_map(
+            edited_norm_unet, edited_probability, edited_unet_mask, edited_score = unet_probability_map(
                 edited_ds, unet_model, unet_config
             )
             image_threshold = float(unet_config["image_threshold"])
-            clean_score = float(np.max(clean_probability))
-            edited_score = float(np.max(edited_probability))
             no_reference_rows.append({
                 "name": "Supervised U-Net pixel localizer",
                 "clean_flag": int(clean_score >= image_threshold),
                 "edited_flag": int(edited_score >= image_threshold),
-                "detail": (f"Edited max pixel probability {edited_score:.4f}; image threshold "
+                "detail": (f"Edited image score {edited_score:.4f} ({unet_config.get('image_score_type', 'legacy max probability')}); threshold "
                            f"{image_threshold:.4f}; predicted mask pixels "
                            f"{int(np.count_nonzero(edited_unet_mask)):,} at "
                            f"{int(unet_config['image_size'])}x{int(unet_config['image_size'])}."),
@@ -397,6 +426,8 @@ def show_saved_results():
         ("Supervised U-Net localization metrics", UNET_RESULTS_DIR / "pixel_localization_summary.csv"),
         ("Supervised U-Net study-level metrics", UNET_RESULTS_DIR / "pixel_localization_study_metrics.csv"),
         ("Supervised U-Net training history", UNET_RESULTS_DIR / "training_history.csv"),
+        ("Signed-manifest security scenarios", SECURITY_EXPERIMENT_OUTPUT / "security_scenarios.csv"),
+        ("Signed-manifest operation timings", SECURITY_EXPERIMENT_OUTPUT / "security_performance.csv"),
     ]
     for title, path in results:
         with st.expander(title, expanded=False):
@@ -424,18 +455,691 @@ def show_saved_results():
             st.caption("Each figure shows a clean slice, synthetic edit, generated mask, and U-Net prediction at the resized model grid.")
 
 
+def _security_registry() -> dict:
+    if not SECURITY_TRUST_REGISTRY.is_file():
+        return {"schema_version": 1, "signers": {}}
+    return json.loads(SECURITY_TRUST_REGISTRY.read_text(encoding="utf-8"))
+
+
+def _security_key_files(pattern: str) -> list[Path]:
+    return sorted(SECURITY_KEYS.glob(pattern)) if SECURITY_KEYS.is_dir() else []
+
+
+def _security_result_summary(result: dict) -> dict:
+    """Show verification status without exposing UID or digest values in the UI."""
+    details = result.get("details", {})
+    safe_details = {}
+    for key in ("reason", "signer_id", "verified_scopes", "signature_valid"):
+        if key in details:
+            safe_details[key] = details[key]
+    if "digest_mismatches" in details:
+        safe_details["digest_mismatch_scopes"] = sorted(details["digest_mismatches"])
+    if "identifier_mismatches" in details:
+        safe_details["identifier_mismatch_fields"] = sorted(details["identifier_mismatches"])
+    summary = {"status": result.get("status"), "details": safe_details}
+    if "hmac" in result:
+        summary["hmac"] = {"status": result["hmac"].get("status")}
+    return summary
+
+
+def _show_secure_exchange(paths: list[Path]) -> None:
+    st.subheader("Authenticated DICOM exchange")
+    st.write("Create a signed manifest, check sender trust and content integrity, and run the existing analysis only after verification.")
+    st.warning("This is a local file-level research demo. It does not send data over TCP/TLS or open a DICOM network association. Keys are stored on the Streamlit app host.")
+
+    selected_index = st.selectbox(
+        "CPAISD test slice for this security workflow", range(len(paths)), index=0,
+        format_func=lambda index: f"Test slice {index + 1:03d} of {len(paths)}",
+        key="security_exchange_slice",
+    )
+    dicom_path = paths[selected_index]
+    st.caption("The selected original is read-only in these controls. Signed manifests contain linkable DICOM UIDs; handle them as sensitive. Demo outputs are written under `reports/security_ui/`.")
+
+    key_tab, manifest_tab, analysis_tab, batch_tab, privacy_tab, storage_tab, results_tab = st.tabs([
+        "Keys and trust", "Sign and verify", "Verify + AI", "Batch workflow",
+        "Research-copy transform", "At-rest encryption", "Security experiment",
+    ])
+
+    with key_tab:
+        st.markdown("#### Ed25519 signer keys")
+        st.caption(f"Keys are kept outside the repository in `{SECURITY_HOME}`. Share public keys through a trusted out-of-band process; do not upload a received key and trust it automatically.")
+        key_label = st.text_input("Key name", value="research-sender", key="security_key_label")
+        cleaned_label = "".join(char for char in key_label.strip() if char.isalnum() or char in "-_")
+        if st.button("Generate Ed25519 keypair", key="security_generate_signer"):
+            if not cleaned_label:
+                st.error("Choose a key name containing letters, numbers, hyphens, or underscores.")
+            else:
+                private_path = SECURITY_KEYS / f"{cleaned_label}-private.pem"
+                public_path = SECURITY_KEYS / f"{cleaned_label}-public.pem"
+                try:
+                    signer_id = generate_ed25519_keypair(private_path, public_path)
+                    st.success(f"Created signer `{signer_id}`. Private key: `{private_path}`")
+                except FileExistsError:
+                    st.error("That key name already exists. Choose a new name; existing keys are never overwritten.")
+                except Exception as exc:
+                    st.error(f"Key generation failed: {type(exc).__name__}: {exc}")
+
+        public_files = _security_key_files("*-public.pem")
+        st.markdown("#### Local trusted-signer registry")
+        if public_files:
+            public_choice = st.selectbox("Public key to register", public_files, format_func=lambda path: path.name,
+                                         key="security_public_key_choice")
+            try:
+                signer_id = key_id_for_public_key(load_public_key(public_choice))
+                st.code(f"Signer ID: {signer_id}")
+                st.download_button(
+                    "Download selected public key",
+                    public_choice.read_bytes(), file_name=public_choice.name,
+                    mime="application/x-pem-file", key="security_public_key_download",
+                )
+                if st.button("Add public key to trusted registry", key="security_trust_add"):
+                    add_trusted_signer(SECURITY_TRUST_REGISTRY, signer_id, public_choice)
+                    st.success("Public key added to the local registry.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Could not read this public key: {type(exc).__name__}: {exc}")
+        else:
+            st.info("Generate a signer keypair to enable trust registration.")
+
+        st.markdown("#### Import and explicitly trust a sender key")
+        st.caption("Only trust a public key after confirming its fingerprint with the sender through a separate trusted channel.")
+        imported_public = st.file_uploader("Sender Ed25519 public key (.pem/.pub)", type=["pem", "pub", "txt"],
+                                           key="security_import_public_key")
+        if imported_public is not None:
+            try:
+                with tempfile.TemporaryDirectory(prefix="dicom_trust_key_") as temp_name:
+                    candidate = Path(temp_name) / "sender-public.pem"
+                    candidate.write_bytes(imported_public.getvalue())
+                    imported_id = key_id_for_public_key(load_public_key(candidate))
+                st.code(f"Fingerprint / signer ID: {imported_id}")
+                if st.button("Trust this sender key", key="security_trust_imported_key"):
+                    SECURITY_KEYS.mkdir(parents=True, exist_ok=True)
+                    persisted_key = SECURITY_KEYS / f"{imported_id}-public.pem"
+                    if not persisted_key.exists():
+                        persisted_key.write_bytes(imported_public.getvalue())
+                    add_trusted_signer(SECURITY_TRUST_REGISTRY, imported_id, persisted_key)
+                    st.success("Sender key explicitly added to this app's trusted registry.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Uploaded key is not a valid Ed25519 public key: {type(exc).__name__}: {exc}")
+
+        registry = _security_registry()
+        signer_entries = registry.get("signers", {})
+        if signer_entries:
+            signer_ids = sorted(signer_entries)
+            revoke_choice = st.selectbox("Signer to deactivate", signer_ids, key="security_revoke_choice")
+            if st.button("Deactivate signer", key="security_revoke"):
+                try:
+                    revoke_trusted_signer(SECURITY_TRUST_REGISTRY, revoke_choice)
+                    st.success("Signer deactivated. Future verification will reject it.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not deactivate signer: {type(exc).__name__}: {exc}")
+            st.dataframe(pd.DataFrame([
+                {"Signer ID": signer_id, "Algorithm": entry.get("algorithm"),
+                 "Active": bool(entry.get("active", True))}
+                for signer_id, entry in signer_entries.items()
+            ]), use_container_width=True, hide_index=True)
+        else:
+            st.info("No trusted signers registered yet.")
+
+        st.markdown("#### Optional local secrets")
+        secret_columns = st.columns(3)
+        secret_specs = [
+            ("HMAC-SHA256", "demo-hmac.secret", generate_hmac_key),
+            ("Pseudonymization", "demo-pseudonym.secret", generate_hmac_key),
+            ("AES-256-GCM", "demo-aes.secret", generate_aes256_key),
+        ]
+        for column, (title, filename, generator) in zip(secret_columns, secret_specs):
+            secret_path = SECURITY_KEYS / filename
+            column.caption(title)
+            if column.button(f"Generate {title} key", key=f"generate_{filename}"):
+                try:
+                    generator(secret_path)
+                    column.success(f"Saved `{secret_path.name}`")
+                except FileExistsError:
+                    column.warning("Key already exists; it was not overwritten.")
+                except Exception as exc:
+                    column.error(f"Generation failed: {type(exc).__name__}: {exc}")
+
+    local_manifests_dir = SECURITY_UI_OUTPUT / "manifests"
+    local_manifests = sorted(local_manifests_dir.glob("*.manifest.json")) if local_manifests_dir.is_dir() else []
+    private_keys = _security_key_files("*-private.pem")
+    hmac_keys = sorted(set(_security_key_files("*-hmac.secret") + _security_key_files("demo-hmac.secret")))
+    pseudonym_keys = sorted(set(_security_key_files("*-pseudonym.secret") + _security_key_files("demo-pseudonym.secret")))
+    aes_keys = sorted(set(_security_key_files("*-aes.secret") + _security_key_files("demo-aes.secret")))
+
+    with manifest_tab:
+        st.markdown("#### Sign selected DICOM object")
+        st.caption("The manifest covers metadata and PixelData. The optional raw-file digest also detects byte-level reserialization differences.")
+        if private_keys:
+            signing_key = st.selectbox("Ed25519 private key", private_keys,
+                                       format_func=lambda path: path.name, key="security_signing_key")
+            include_raw = st.checkbox("Include raw-file SHA-256", value=True, key="security_raw_hash")
+            sign_hmac = st.checkbox("Also create an HMAC-SHA256 sidecar", value=False, key="security_sign_hmac")
+            signing_hmac_key = None
+            if sign_hmac and hmac_keys:
+                signing_hmac_key = st.selectbox("HMAC key", hmac_keys, format_func=lambda path: path.name,
+                                                key="security_hmac_signing_key")
+            elif sign_hmac:
+                st.warning("Generate an HMAC key in the Keys and trust tab first.")
+            if st.button("Sign selected DICOM", type="primary", key="security_sign_object",
+                          disabled=sign_hmac and signing_hmac_key is None):
+                try:
+                    SECURITY_UI_OUTPUT.mkdir(parents=True, exist_ok=True)
+                    local_manifests_dir.mkdir(parents=True, exist_ok=True)
+                    manifest_path = local_manifests_dir / f"test-slice-{selected_index + 1:04d}-{uuid.uuid4().hex[:8]}.manifest.json"
+                    envelope = create_signed_manifest(dicom_path, signing_key, include_raw_file_hash=include_raw)
+                    save_signed_manifest(envelope, manifest_path)
+                    if signing_hmac_key:
+                        tag = hmac_sha256(signing_hmac_key.read_bytes(), canonical_json_bytes(envelope["manifest"]))
+                        Path(str(manifest_path) + ".hmac").write_text(
+                            json.dumps({"algorithm": "HMAC-SHA256", "tag": tag}, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
+                    append_audit_event(
+                        SECURITY_AUDIT_LOG, "sign_manifest", "SIGNED", actor_id="streamlit-local-signer",
+                        source_sha256=raw_file_sha256(dicom_path), output_sha256=raw_file_sha256(manifest_path),
+                        details={"signer_id": envelope["manifest"]["signer_id"], "hmac_created": bool(signing_hmac_key)},
+                    )
+                    st.session_state["security_last_manifest"] = str(manifest_path)
+                    st.success(f"Signed manifest created: `{manifest_path.relative_to(PROJECT_ROOT)}`")
+                    st.caption(f"Signer ID: `{envelope['manifest']['signer_id']}` · Manifest ID: `{envelope['manifest']['manifest_id']}`")
+                    st.download_button("Download signed manifest", manifest_path.read_bytes(),
+                                       file_name=manifest_path.name, mime="application/json", key="download_signed_manifest")
+                except Exception as exc:
+                    st.error(f"Signing failed: {type(exc).__name__}: {exc}")
+        else:
+            st.info("Generate an Ed25519 keypair in the Keys and trust tab before signing.")
+
+        st.markdown("#### Verify a signed manifest")
+        if local_manifests:
+            remembered = st.session_state.get("security_last_manifest")
+            default_manifest = next((idx for idx, path in enumerate(local_manifests) if str(path) == remembered), 0)
+            manifest_path = st.selectbox("Manifest sidecar", local_manifests, index=default_manifest,
+                                         format_func=lambda path: path.name, key="security_verify_manifest")
+            current_registry = _security_registry()
+            trusted = sorted(current_registry.get("signers", {}))
+            expected_options = ["Any active trusted signer"] + trusted
+            expected_signer = st.selectbox("Expected signer", expected_options, key="security_expected_signer")
+            use_hmac = st.checkbox("Verify optional HMAC sidecar", value=False, key="security_verify_hmac")
+            verify_hmac_key = st.selectbox("HMAC key", hmac_keys, format_func=lambda path: path.name,
+                                           key="security_hmac_verify_key") if use_hmac and hmac_keys else None
+            use_replay = st.checkbox("Use local replay cache (second verification of the same manifest is flagged)",
+                                     value=False, key="security_use_replay")
+            if use_hmac and not verify_hmac_key:
+                st.warning("No HMAC key is available. Generate one in the Keys and trust tab.")
+            if st.button("Verify selected file and manifest", key="security_verify_object",
+                         disabled=use_hmac and verify_hmac_key is None):
+                try:
+                    registry = _security_registry()
+                    replay_path = SECURITY_REPLAY_CACHE if use_replay else None
+                    result = verify_signed_manifest(
+                        dicom_path, manifest_path, registry,
+                        expected_signer=None if expected_signer == expected_options[0] else expected_signer,
+                        replay_cache_path=replay_path,
+                    )
+                    if verify_hmac_key:
+                        sidecar_path = Path(str(manifest_path) + ".hmac")
+                        try:
+                            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                            envelope = json.loads(manifest_path.read_text(encoding="utf-8"))
+                            valid = verify_hmac_sha256(verify_hmac_key.read_bytes(),
+                                                       canonical_json_bytes(envelope["manifest"]), sidecar["tag"])
+                            result["hmac"] = {"status": "VALID" if valid else "INVALID"}
+                        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                            result["hmac"] = {"status": "MISSING_OR_INVALID"}
+                    append_audit_event(SECURITY_AUDIT_LOG, "verify_manifest", result["status"],
+                                       actor_id="streamlit-local-verifier",
+                                       source_sha256=raw_file_sha256(dicom_path),
+                                       details={"manifest_file": manifest_path.name})
+                    hmac_status = result.get("hmac", {}).get("status")
+                    if result["status"] == "VERIFIED" and (not use_hmac or hmac_status == "VALID"):
+                        st.success("Cryptographic verification passed.")
+                    elif result["status"] == "VERIFIED":
+                        st.error(f"Signed manifest passed, but HMAC verification failed: {hmac_status}.")
+                    else:
+                        st.error(f"Verification outcome: {result['status']}")
+                    st.json(_security_result_summary(result))
+                except Exception as exc:
+                    st.error(f"Verification failed: {type(exc).__name__}: {exc}")
+        else:
+            st.info("No local signed manifests yet. Sign a preloaded slice above to create one.")
+
+        st.divider()
+        st.markdown("#### Sign a DICOM file for exchange")
+        st.caption("Upload is processed in temporary storage for this session; the source DICOM is not added to the project dataset.")
+        exchange_file = st.file_uploader("DICOM file to sign", key="security_exchange_sign_upload")
+        if private_keys:
+            exchange_signer = st.selectbox(
+                "Signing key for uploaded file", private_keys,
+                format_func=lambda path: path.name, key="security_exchange_signer",
+            )
+            exchange_include_raw = st.checkbox(
+                "Include raw-file SHA-256 in exchange manifest", value=True,
+                key="security_exchange_raw_hash",
+            )
+            exchange_hmac = st.checkbox("Create an additional HMAC sidecar", value=False,
+                                         key="security_exchange_hmac")
+            exchange_hmac_key = st.selectbox(
+                "Shared HMAC key", hmac_keys, format_func=lambda path: path.name,
+                key="security_exchange_hmac_key",
+            ) if exchange_hmac and hmac_keys else None
+            if exchange_hmac and exchange_hmac_key is None:
+                st.warning("Generate an HMAC key in the Keys and trust tab first.")
+            if st.button("Create exchange manifest", key="security_exchange_sign_button",
+                         disabled=exchange_file is None or (exchange_hmac and exchange_hmac_key is None)):
+                try:
+                    with tempfile.TemporaryDirectory(prefix="dicom_exchange_sign_") as temp_name:
+                        temp_dir = Path(temp_name)
+                        source = temp_dir / Path(exchange_file.name).name
+                        source.write_bytes(exchange_file.getvalue())
+                        envelope = create_signed_manifest(
+                            source, exchange_signer,
+                            include_raw_file_hash=exchange_include_raw,
+                        )
+                        manifest_bytes = canonical_json_bytes(envelope) + b"\n"
+                        manifest_name = f"{source.stem}.manifest.json"
+                        event_path = temp_dir / manifest_name
+                        event_path.write_bytes(manifest_bytes)
+                        hmac_bytes = None
+                        if exchange_hmac_key is not None:
+                            hmac_tag = hmac_sha256(
+                                exchange_hmac_key.read_bytes(),
+                                canonical_json_bytes(envelope["manifest"]),
+                            )
+                            hmac_bytes = (json.dumps({"algorithm": "HMAC-SHA256", "tag": hmac_tag},
+                                                     sort_keys=True) + "\n").encode("utf-8")
+                        append_audit_event(
+                            SECURITY_AUDIT_LOG, "sign_uploaded_manifest", "SIGNED",
+                            actor_id="streamlit-local-signer",
+                            source_sha256=raw_file_sha256(source),
+                            output_sha256=raw_file_sha256(event_path),
+                            details={"signer_id": envelope["manifest"]["signer_id"]},
+                        )
+                        st.session_state["security_exchange_manifest_bytes"] = manifest_bytes
+                        st.session_state["security_exchange_manifest_name"] = manifest_name
+                        st.session_state["security_exchange_hmac_bytes"] = hmac_bytes
+                        st.session_state["security_exchange_hmac_name"] = f"{manifest_name}.hmac"
+                        st.session_state["security_exchange_signer_id"] = envelope["manifest"]["signer_id"]
+                    st.success("Exchange manifest signed. Send it alongside the original DICOM file.")
+                    st.caption(f"Signer ID: `{st.session_state['security_exchange_signer_id']}`")
+                    st.download_button(
+                        "Download exchange manifest",
+                        st.session_state["security_exchange_manifest_bytes"],
+                        file_name=st.session_state["security_exchange_manifest_name"],
+                        mime="application/json", key="security_exchange_manifest_download",
+                    )
+                    if st.session_state.get("security_exchange_hmac_bytes") is not None:
+                        st.download_button(
+                            "Download HMAC sidecar",
+                            st.session_state["security_exchange_hmac_bytes"],
+                            file_name=st.session_state["security_exchange_hmac_name"],
+                            mime="application/json", key="security_exchange_hmac_download",
+                        )
+                except Exception as exc:
+                    st.error(f"Could not sign uploaded DICOM: {type(exc).__name__}: {exc}")
+        else:
+            st.info("Generate an Ed25519 keypair first to sign an uploaded DICOM file.")
+
+        st.markdown("#### Verify received DICOM and manifest")
+        received_file = st.file_uploader("Received DICOM file", key="security_exchange_verify_dicom")
+        received_manifest = st.file_uploader("Received signed manifest (.json)", type=["json"],
+                                             key="security_exchange_verify_manifest")
+        verify_exchange_hmac = st.checkbox("Also verify a shared-secret HMAC sidecar", value=False,
+                                            key="security_exchange_verify_hmac")
+        received_hmac = st.file_uploader("Received HMAC sidecar", type=["hmac", "json"],
+                                         key="security_exchange_verify_hmac_upload") if verify_exchange_hmac else None
+        received_hmac_key = st.selectbox(
+            "Local HMAC key", hmac_keys, format_func=lambda path: path.name,
+            key="security_exchange_verify_hmac_key",
+        ) if verify_exchange_hmac and hmac_keys else None
+        use_exchange_replay = st.checkbox(
+            "Apply local replay check to this manifest", value=False,
+            key="security_exchange_replay_check",
+        )
+        if st.button("Verify received pair", key="security_exchange_verify_button",
+                     disabled=(received_file is None or received_manifest is None or
+                               (verify_exchange_hmac and (received_hmac is None or received_hmac_key is None)))):
+            try:
+                with tempfile.TemporaryDirectory(prefix="dicom_exchange_verify_") as temp_name:
+                    temp_dir = Path(temp_name)
+                    received_path = temp_dir / Path(received_file.name).name
+                    manifest_path = temp_dir / "received.manifest.json"
+                    received_path.write_bytes(received_file.getvalue())
+                    manifest_path.write_bytes(received_manifest.getvalue())
+                    result = verify_signed_manifest(
+                        received_path, manifest_path, _security_registry(),
+                        replay_cache_path=SECURITY_REPLAY_CACHE if use_exchange_replay else None,
+                    )
+                    if verify_exchange_hmac and received_hmac is not None and received_hmac_key is not None:
+                        try:
+                            hmac_sidecar = json.loads(received_hmac.getvalue().decode("utf-8"))
+                            manifest_envelope = json.loads(manifest_path.read_text(encoding="utf-8"))
+                            hmac_valid = (
+                                hmac_sidecar.get("algorithm") == "HMAC-SHA256" and
+                                verify_hmac_sha256(
+                                    received_hmac_key.read_bytes(),
+                                    canonical_json_bytes(manifest_envelope["manifest"]),
+                                    hmac_sidecar["tag"],
+                                )
+                            )
+                            result["hmac"] = {"status": "VALID" if hmac_valid else "INVALID"}
+                        except (UnicodeDecodeError, OSError, ValueError, KeyError, TypeError):
+                            result["hmac"] = {"status": "MISSING_OR_INVALID"}
+                    append_audit_event(
+                        SECURITY_AUDIT_LOG, "verify_received_manifest", result["status"],
+                        actor_id="streamlit-local-verifier",
+                        source_sha256=raw_file_sha256(received_path),
+                        details={"manifest_file": Path(received_manifest.name).name},
+                    )
+                hmac_status = result.get("hmac", {}).get("status")
+                if result["status"] == "VERIFIED" and (not verify_exchange_hmac or hmac_status == "VALID"):
+                    st.success("Received DICOM passed signature and integrity verification.")
+                elif result["status"] == "VERIFIED":
+                    st.error(f"Signed manifest is valid, but the requested HMAC check failed: {hmac_status}.")
+                else:
+                    st.error(f"Received pair verification outcome: {result['status']}")
+                st.json(_security_result_summary(result))
+                st.caption("The sender’s public key must already be trusted in this app’s local signer registry.")
+            except Exception as exc:
+                st.error(f"Could not verify received pair: {type(exc).__name__}: {exc}")
+
+    with analysis_tab:
+        st.markdown("#### Verification-first analysis")
+        st.write("The analysis workflow will not run AI models when signature or content verification fails.")
+        analysis_manifests = sorted(local_manifests_dir.glob("*.manifest.json")) if local_manifests_dir.is_dir() else []
+        if analysis_manifests:
+            selected_manifest = st.selectbox("Signed reference for this slice", analysis_manifests,
+                                             format_func=lambda path: path.name, key="security_analysis_manifest")
+            analysis_registry_path = st.text_input("Trusted-signer registry", value=str(SECURITY_TRUST_REGISTRY),
+                                                   key="security_analysis_registry")
+            model_cols = st.columns(4)
+            run_if = model_cols[0].checkbox("Isolation Forest", value=True, key="security_ai_if")
+            run_ae = model_cols[1].checkbox("Metadata autoencoder", value=True, key="security_ai_ae")
+            run_pixel = model_cols[2].checkbox("Patch pixel IF", value=True, key="security_ai_pixel")
+            run_unet = model_cols[3].checkbox("U-Net (slower)", value=False, key="security_ai_unet")
+            use_analysis_replay = st.checkbox("Apply local replay-cache check", value=False, key="security_analysis_replay")
+            if st.button("Verify, then analyze", type="primary", key="security_verify_analyze"):
+                try:
+                    registry = json.loads(Path(analysis_registry_path).read_text(encoding="utf-8"))
+                    crypto_result = verify_signed_manifest(
+                        dicom_path, selected_manifest, registry,
+                        replay_cache_path=SECURITY_REPLAY_CACHE if use_analysis_replay else None,
+                    )
+                    if crypto_result["status"] == "VERIFIED":
+                        result = verify_then_analyze(
+                            dicom_path, selected_manifest, analysis_registry_path,
+                            if_model_path=IF_MODEL if run_if else None,
+                            autoencoder_model_path=AE_MODEL if run_ae else None,
+                            pixel_model_path=PIXEL_MODEL if run_pixel else None,
+                            unet_checkpoint_path=UNET_MODEL if run_unet and UNET_MODEL.is_file() else None,
+                        )
+                        result["cryptographic"] = _security_result_summary(crypto_result)
+                    else:
+                        result = {"cryptographic": _security_result_summary(crypto_result),
+                                  "ml_status": "SKIPPED_CRYPTOGRAPHIC_POLICY",
+                                  "reason": "AI analysis is blocked when the signed manifest is not verified."}
+                    SECURITY_UI_OUTPUT.mkdir(parents=True, exist_ok=True)
+                    analysis_path = SECURITY_UI_OUTPUT / f"single_analysis_{uuid.uuid4().hex[:8]}.json"
+                    analysis_path.write_text(json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8")
+                    st.session_state["security_last_analysis"] = str(analysis_path)
+                    if crypto_result["status"] == "VERIFIED":
+                        st.success("Verified object analyzed. Cryptographic and AI findings are shown separately.")
+                    else:
+                        st.error(f"Cryptographic status: {crypto_result['status']} · AI analysis skipped.")
+                    st.json(result)
+                    st.download_button("Download structured analysis", analysis_path.read_bytes(),
+                                       file_name=analysis_path.name, mime="application/json", key="download_security_analysis")
+                except Exception as exc:
+                    st.error(f"Analysis failed: {type(exc).__name__}: {exc}")
+        else:
+            st.info("Sign this slice first, then select its manifest here.")
+
+    with batch_tab:
+        st.markdown("#### Sign the test fold")
+        st.write("Creates one signed sidecar per preloaded test DICOM, preserving the relative directory layout. Original DICOM files remain untouched.")
+        if private_keys:
+            batch_signer = st.selectbox("Batch signing key", private_keys, format_func=lambda path: path.name,
+                                        key="security_batch_signer")
+            batch_raw = st.checkbox("Include raw-file digest in every manifest", value=True, key="security_batch_raw")
+            if st.button(f"Sign all {len(paths)} test files", key="security_batch_sign"):
+                batch_root = (SECURITY_UI_OUTPUT / "batch_manifests" /
+                              f"{batch_signer.stem.replace('-private', '')}_{uuid.uuid4().hex[:8]}")
+                batch_root.mkdir(parents=True, exist_ok=True)
+                progress = st.progress(0.0, text="Signing test-fold files…")
+                signed_count = 0
+                try:
+                    for idx, source in enumerate(paths):
+                        relative = Path(relative_key(source, DATASET_DIR))
+                        sidecar = batch_root / f"{relative}.manifest.json"
+                        envelope = create_signed_manifest(source, batch_signer, include_raw_file_hash=batch_raw)
+                        save_signed_manifest(envelope, sidecar)
+                        signed_count += 1
+                        if (idx + 1) % 10 == 0 or idx + 1 == len(paths):
+                            progress.progress((idx + 1) / len(paths), text=f"Signed {idx + 1}/{len(paths)}")
+                    st.session_state["security_batch_manifest_root"] = str(batch_root)
+                    st.success(f"Signed {signed_count} DICOM files. Manifests are in `{batch_root.relative_to(PROJECT_ROOT)}`.")
+                except Exception as exc:
+                    st.error(f"Batch signing stopped after {signed_count} files: {type(exc).__name__}: {exc}")
+        else:
+            st.info("Generate a signer keypair before batch signing.")
+
+        batch_roots = sorted((SECURITY_UI_OUTPUT / "batch_manifests").glob("*") if
+                             (SECURITY_UI_OUTPUT / "batch_manifests").is_dir() else [])
+        batch_roots = [root for root in batch_roots if root.is_dir()]
+        if batch_roots:
+            selected_batch_root = st.selectbox("Manifest directory", batch_roots,
+                                               format_func=lambda path: path.name, key="security_batch_manifest_root")
+            st.markdown("#### Verify directory, then run selected models")
+            batch_model_cols = st.columns(4)
+            batch_if = batch_model_cols[0].checkbox("Isolation Forest", value=True, key="security_batch_if")
+            batch_ae = batch_model_cols[1].checkbox("Metadata autoencoder", value=True, key="security_batch_ae")
+            batch_pixel = batch_model_cols[2].checkbox("Patch pixel IF", value=False, key="security_batch_pixel")
+            batch_unet = batch_model_cols[3].checkbox("U-Net (slow; optional)", value=False, key="security_batch_unet")
+            if st.button("Verify directory and analyze verified files", key="security_batch_analyze"):
+                try:
+                    with st.spinner("Verifying manifests; study/series checks use verified files only…"):
+                        result = verify_directory_then_analyze(
+                            DATASET_DIR, selected_batch_root, SECURITY_TRUST_REGISTRY,
+                            if_model_path=IF_MODEL if batch_if else None,
+                            autoencoder_model_path=AE_MODEL if batch_ae else None,
+                            pixel_model_path=PIXEL_MODEL if batch_pixel else None,
+                            unet_checkpoint_path=UNET_MODEL if batch_unet and UNET_MODEL.is_file() else None,
+                        )
+                    # Keep the downloadable app report free of digest and DICOM UID values.
+                    for record in result.get("results", {}).values():
+                        record["cryptographic"] = _security_result_summary(record.get("cryptographic", {}))
+                    SECURITY_UI_OUTPUT.mkdir(parents=True, exist_ok=True)
+                    report_path = SECURITY_UI_OUTPUT / f"batch_analysis_{uuid.uuid4().hex[:8]}.json"
+                    report_path.write_text(json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8")
+                    status_counts = {}
+                    for record in result["results"].values():
+                        status = record["cryptographic"]["status"]
+                        status_counts[status] = status_counts.get(status, 0) + 1
+                    st.session_state["security_last_batch_analysis"] = str(report_path)
+                    st.metric("Files verified", f"{result['files_verified']} / {result['files_discovered']}")
+                    st.json({"crypto_status_counts": status_counts, "ml_status": result["ml_status"]})
+                    summary_rows = []
+                    for token, record in result["results"].items():
+                        summary_rows.append({
+                            "File token": token,
+                            "Crypto": record["cryptographic"]["status"],
+                            "Structural finding": bool(record.get("structural", [])),
+                            "Semantic finding": bool(record.get("semantic", [])),
+                            "IF flag": record.get("metadata_anomaly", {}).get("isolation_forest", {}).get("flag"),
+                            "AE flag": record.get("metadata_anomaly", {}).get("autoencoder", {}).get("flag"),
+                        })
+                    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+                    st.download_button("Download batch analysis JSON", report_path.read_bytes(),
+                                       file_name=report_path.name, mime="application/json", key="download_batch_analysis")
+                except Exception as exc:
+                    st.error(f"Directory analysis failed: {type(exc).__name__}: {exc}")
+
+    with privacy_tab:
+        st.markdown("#### Verify, create a research copy, and sign it again")
+        st.warning("This is limited metadata pseudonymization. It does not OCR or remove burned-in pixel identifiers and is not a complete DICOM PS3.15 de-identification implementation.")
+        privacy_manifests = sorted(local_manifests_dir.glob("*.manifest.json")) if local_manifests_dir.is_dir() else []
+        if privacy_manifests and private_keys and pseudonym_keys:
+            source_manifest = st.selectbox("Source signed manifest", privacy_manifests,
+                                           format_func=lambda path: path.name, key="security_privacy_manifest")
+            pseudonym_key = st.selectbox("Pseudonymization key", pseudonym_keys,
+                                         format_func=lambda path: path.name, key="security_pseudonym_key")
+            new_signing_key = st.selectbox("Key to sign transformed copy", private_keys,
+                                           format_func=lambda path: path.name, key="security_privacy_signer")
+            if st.button("Verify and create signed research copy", key="security_transform"):
+                try:
+                    crypto = verify_signed_manifest(dicom_path, source_manifest, _security_registry())
+                    if crypto["status"] != "VERIFIED":
+                        st.error(f"Source verification failed ({crypto['status']}); transformation was not performed.")
+                    else:
+                        output_dir = SECURITY_UI_OUTPUT / "research_copies"
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        suffix = uuid.uuid4().hex[:8]
+                        output_dicom = output_dir / f"research_copy_{selected_index + 1:04d}_{suffix}.dcm"
+                        output_manifest = output_dir / f"research_copy_{selected_index + 1:04d}_{suffix}.manifest.json"
+                        privacy_report = deidentify_research_copy(dicom_path, output_dicom, pseudonym_key.read_bytes())
+                        new_envelope = create_signed_manifest(output_dicom, new_signing_key)
+                        save_signed_manifest(new_envelope, output_manifest)
+                        append_audit_event(
+                            SECURITY_AUDIT_LOG, "verify_deidentify_resign", "TRANSFORMED_AND_RESIGNED",
+                            actor_id="streamlit-local-transformer", source_sha256=privacy_report["source_sha256"],
+                            output_sha256=privacy_report["output_sha256"],
+                            details={"new_signer_id": new_envelope["manifest"]["signer_id"],
+                                     "pixel_review_required": privacy_report["pixel_review_required"]},
+                        )
+                        if privacy_report["pixel_review_required"]:
+                            st.warning("Manual pixel review is required before using this copy because BurnedInAnnotation is not NO.")
+                        st.success("Source signature verified; a separate transformed copy was created and freshly signed.")
+                        st.json({"original_verification": crypto,
+                                 "output_file": output_dicom.name,
+                                 "new_signer_id": new_envelope["manifest"]["signer_id"],
+                                 "pixel_review_required": privacy_report["pixel_review_required"],
+                                 "warning": privacy_report["warning"]})
+                        st.download_button("Download transformed DICOM", output_dicom.read_bytes(),
+                                           file_name=output_dicom.name, mime="application/dicom", key="download_research_copy")
+                        st.download_button("Download new signed manifest", output_manifest.read_bytes(),
+                                           file_name=output_manifest.name, mime="application/json", key="download_research_manifest")
+                except Exception as exc:
+                    st.error(f"Research-copy transformation failed: {type(exc).__name__}: {exc}")
+        else:
+            st.info("Create a signed manifest, an Ed25519 keypair, and a pseudonymization key before this workflow is available.")
+
+    with storage_tab:
+        st.markdown("#### AES-256-GCM encryption at rest")
+        st.info("This encrypts a file stored on disk. It does not provide encryption for a network connection or replace TLS.")
+        if not aes_keys:
+            st.caption("Generate an AES key in the Keys and trust tab first.")
+        else:
+            aes_key = st.selectbox("AES key", aes_keys, format_func=lambda path: path.name, key="security_aes_key")
+            if st.button("Encrypt selected CPAISD file", key="security_encrypt_selected"):
+                try:
+                    output_dir = SECURITY_UI_OUTPUT / "encrypted"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    encrypted_path = output_dir / f"slice_{selected_index + 1:04d}_{uuid.uuid4().hex[:8]}.dsf"
+                    report = encrypt_file(dicom_path, encrypted_path, aes_key.read_bytes())
+                    st.success(f"Encrypted file created ({report['ciphertext_bytes']:,} bytes).")
+                    st.json({"plaintext_bytes": report["plaintext_bytes"],
+                             "ciphertext_bytes": report["ciphertext_bytes"],
+                             "source_sha256": report["source_sha256"]})
+                    st.download_button("Download AES-GCM encrypted file", encrypted_path.read_bytes(),
+                                       file_name=encrypted_path.name, mime="application/octet-stream",
+                                       key="download_encrypted_dicom")
+                except Exception as exc:
+                    st.error(f"Encryption failed: {type(exc).__name__}: {exc}")
+            encrypted_upload = st.file_uploader("Upload a `.dsf` file to decrypt with this key", type=None,
+                                                key="security_encrypted_upload")
+            if encrypted_upload is not None and st.button("Decrypt uploaded file in memory", key="security_decrypt_upload"):
+                try:
+                    with tempfile.TemporaryDirectory(prefix="dicom_secure_decrypt_") as temp_dir:
+                        encrypted_temp = Path(temp_dir) / "incoming.dsf"
+                        output_temp = Path(temp_dir) / "recovered.dcm"
+                        encrypted_temp.write_bytes(encrypted_upload.getvalue())
+                        decrypt_file(encrypted_temp, output_temp, aes_key.read_bytes())
+                        plaintext = output_temp.read_bytes()
+                    st.success("AES-GCM authentication passed; decrypted bytes are ready to download.")
+                    st.download_button("Download decrypted DICOM", plaintext,
+                                       file_name="recovered.dcm", mime="application/dicom",
+                                       key="download_decrypted_dicom")
+                except Exception as exc:
+                    st.error(f"Decryption/authentication failed: {type(exc).__name__}: {exc}")
+
+    with results_tab:
+        st.markdown("#### Saved 809-file security experiment")
+        summary_path = SECURITY_EXPERIMENT_OUTPUT / "security_summary.json"
+        scenarios_path = SECURITY_EXPERIMENT_OUTPUT / "security_scenarios.csv"
+        performance_path = SECURITY_EXPERIMENT_OUTPUT / "security_performance.csv"
+        if summary_path.is_file():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            metrics = st.columns(4)
+            metrics[0].metric("Test files", summary.get("input_files", "—"))
+            metrics[1].metric("Scenario checks", f"{summary.get('scenario_rows', 0):,}")
+            metrics[2].metric("Mean sign time", f"{summary.get('mean_signing_latency_ms', 0):.2f} ms")
+            metrics[3].metric("Mean verify time", f"{summary.get('mean_verification_latency_ms', 0):.2f} ms")
+            st.caption(f"Mean signed envelope: {summary.get('mean_manifest_bytes', 0):.1f} bytes · Relative size: {summary.get('mean_manifest_overhead_fraction', 0) * 100:.4f}%")
+            counts = summary.get("scenario_counts", {})
+            if counts:
+                st.dataframe(pd.DataFrame([
+                    {"Scenario outcome": name.replace(":", " · "), "Files": count}
+                    for name, count in sorted(counts.items())
+                ]), use_container_width=True, hide_index=True)
+            if scenarios_path.is_file():
+                with st.expander("Per-file security scenario records"):
+                    st.dataframe(pd.read_csv(scenarios_path), use_container_width=True, hide_index=True)
+            if performance_path.is_file():
+                with st.expander("Cryptographic operation timings"):
+                    st.dataframe(pd.read_csv(performance_path), use_container_width=True, hide_index=True)
+        else:
+            st.info("No saved full-fold security run is present yet.")
+
+        st.markdown("#### Run full-fold security scenarios")
+        st.caption("This runs signing and verification scenarios over the 809-file test fold. It does not train models or modify source DICOM files; it may take several minutes.")
+        if st.button("Run full 809-file security experiment", key="security_rerun_full_experiment"):
+            output_dir = SECURITY_UI_OUTPUT / "security_experiment_rerun"
+            command = [sys.executable, str(PROJECT_ROOT / "scripts" / "run_crypto_security_experiment.py"),
+                       "--input", str(DATASET_DIR), "--output", str(output_dir)]
+            with st.spinner("Running 13 security scenarios per test file…"):
+                try:
+                    completed = subprocess.run(command, cwd=PROJECT_ROOT, capture_output=True,
+                                               text=True, timeout=1800, check=False)
+                    if completed.returncode == 0:
+                        st.success(f"Completed. Results saved under `{output_dir.relative_to(PROJECT_ROOT)}`.")
+                        if completed.stdout.strip():
+                            try:
+                                st.json(json.loads(completed.stdout))
+                            except json.JSONDecodeError:
+                                st.code(completed.stdout[-5000:])
+                    else:
+                        st.error(f"Experiment failed with exit code {completed.returncode}.")
+                        st.code((completed.stderr or completed.stdout)[-5000:])
+                except subprocess.TimeoutExpired:
+                    st.error("The experiment exceeded the 30-minute UI limit. Check the output directory for partial records.")
+                except Exception as exc:
+                    st.error(f"Could not launch the experiment: {type(exc).__name__}: {exc}")
+
+        if SECURITY_AUDIT_LOG.is_file():
+            with st.expander("Local privacy-minimized audit events"):
+                try:
+                    audit_rows = [json.loads(line) for line in SECURITY_AUDIT_LOG.read_text(encoding="utf-8").splitlines() if line]
+                    st.dataframe(pd.DataFrame(audit_rows), use_container_width=True, hide_index=True)
+                    st.download_button("Download audit JSONL", SECURITY_AUDIT_LOG.read_bytes(),
+                                       file_name="security_audit.jsonl", mime="application/x-ndjson",
+                                       key="download_security_audit")
+                except Exception as exc:
+                    st.warning(f"Could not display audit log: {type(exc).__name__}: {exc}")
+
+
 st.title("DICOM Security Demo Lab")
-st.caption("Preloaded CPAISD brain CT · Interactive metadata and pixel edits · All detector outputs in one view")
+st.caption("Preloaded CPAISD brain CT · Metadata and pixel anomaly checks · Signed-manifest exchange workflow")
 
 if not DATASET_DIR.is_dir():
     st.error(f"Preloaded CPAISD test folder was not found: {DATASET_DIR}")
     st.stop()
 missing = [path for path in (IF_MODEL, AE_MODEL, PIXEL_MODEL, PIXEL_CALIBRATION) if not path.is_file()]
 if missing:
-    st.error("A trained model or calibration file is missing from the project folder:")
+    st.warning("Some preloaded anomaly-model assets are missing. The signed-manifest workspace remains available; dependent attack-lab checks will be limited.")
     for path in missing:
         st.write(f"- `{path.relative_to(PROJECT_ROOT)}`")
-    st.stop()
 
 dicom_paths = [Path(path) for path in get_dicom_paths(str(DATASET_DIR))]
 if not dicom_paths:
@@ -452,12 +1156,15 @@ with st.sidebar:
     st.metric("Available checks", "11" if UNET_MODEL.is_file() else "10")
     if UNET_MODEL.is_file():
         st.caption(f"U-Net checkpoint: {UNET_MODEL.parent.relative_to(PROJECT_ROOT)}")
+    st.caption("Secure exchange keys are stored in the app host's local user profile, not in the repository.")
 
-overview_tab, live_tab, results_tab = st.tabs(["Project overview", "Interactive attack lab", "Experiments completed"])
+overview_tab, live_tab, results_tab, security_tab = st.tabs([
+    "Project overview", "Interactive attack lab", "Experiments completed", "Secure DICOM exchange",
+])
 
 with overview_tab:
     st.subheader("What this demo does")
-    st.write("Pick one preloaded CT slice, apply a controlled metadata edit, pixel edit, or both, and compare the clean and edited copies across the project's implemented integrity and anomaly checks.")
+    st.write("Explore controlled metadata and pixel edits, compare the existing integrity/anomaly checks, and use the signed-manifest tab to sign and verify individual files or the full test fold before analysis.")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Preloaded CT slices", len(dicom_paths))
     c2.metric("Metadata checks", "5")
@@ -478,6 +1185,9 @@ with overview_tab:
         - **Supervised U-Net pixel localizer:** trained on synthetic edit masks; shown when the trained checkpoint is present. Its output is a research baseline, not a clinical assessment.
         - **Pixel/header consistency:** checks whether image payload layout agrees with DICOM header declarations.
         - **All-checks OR summary:** combines whether any of the above checks alert.
+        - **Ed25519 signed manifests:** binds a DICOM object to a trusted sender key and scoped SHA-256 digests.
+        - **HMAC-SHA256, replay cache, audit, and AES-GCM storage:** optional security demonstrations. AES-GCM covers files at rest, not network traffic.
+        - **Verify-first analysis:** cryptographic failures block the AI analysis path by default; study-level checks run only on verified files in batch mode.
         """)
 
 with live_tab:
@@ -504,7 +1214,8 @@ with live_tab:
                 "Copy-move patch (withheld U-Net family)",
             ])
         st.caption("The selected clean slice supplies a temporary reference. Your preloaded dataset files are never overwritten.")
-        run_demo = st.button("Apply change and show everything", type="primary", use_container_width=True)
+        run_demo = st.button("Apply change and show everything", type="primary", use_container_width=True,
+                             disabled=bool(missing))
 
     if run_demo:
         try:
@@ -679,3 +1390,6 @@ with results_tab:
     st.subheader("Previously completed research experiments")
     st.write("These are saved outputs from the project's experiment runs, alongside the interactive one-slice demonstration.")
     show_saved_results()
+
+with security_tab:
+    _show_secure_exchange(dicom_paths)
